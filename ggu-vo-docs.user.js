@@ -1,0 +1,2059 @@
+// ==UserScript==
+// @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
+// @namespace    http://tampermonkey.net/
+// @version      6.1
+// @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
+// @match        *://*/vo/admission/entrants/*/profile*
+// @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
+// @downloadURL  https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // =====================================================================
+    // УТИЛИТЫ
+    // =====================================================================
+
+    const $ = (sel, root = document) => root.querySelector(sel);
+    const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+    function txt(el, def = '') {
+        return el ? el.textContent.trim().replace(/\s+/g, ' ') : def;
+    }
+
+    function escapeHtml(str) {
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function manualStorageKey(profile = {}) {
+        const id = profile.studentId || profile.fullName || location.pathname;
+        return `ggu-vo-docs-manual:${id}`;
+    }
+
+    function loadManual(profile) {
+        try {
+            return JSON.parse(localStorage.getItem(manualStorageKey(profile)) || '{}');
+        } catch {
+            return {};
+        }
+    }
+
+    function saveManual(profile, patch) {
+        const current = loadManual(profile);
+        const merged = {
+            ...current,
+            ...patch,
+            updatedAt: new Date().toISOString(),
+        };
+        localStorage.setItem(manualStorageKey(profile), JSON.stringify(merged));
+        return merged;
+    }
+
+    // Найти ближайший к лейблу элемент-значение (для блоков "Лейбл / значение")
+    function valueByLabel(labelText, root = document) {
+        const labels = $$('.leading-6', root);
+        for (const lab of labels) {
+            if (lab.textContent.trim().toLowerCase().includes(labelText.toLowerCase())) {
+                let sib = lab.nextElementSibling;
+                if (!sib) continue;
+                // иногда значение лежит во вложенном div'е
+                const innerP = sib.querySelector('p, span');
+                return txt(innerP || sib);
+            }
+        }
+        return '';
+    }
+
+    // Найти секцию по заголовку (кнопка > span с нужным текстом)
+    function sectionByTitle(title) {
+        const sections = $$('section.group\\/disclosure, section[class*="group/disclosure"]');
+        for (const s of sections) {
+            const span = s.querySelector('button > span');
+            if (span && span.textContent.trim().toLowerCase().includes(title.toLowerCase())) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    // Найти под-секцию документов по типу (внутри секции "Документы")
+    function documentSubSection(title) {
+        const docsSec = sectionByTitle('Документы');
+        if (!docsSec) return null;
+        const subs = $$('section', docsSec);
+        for (const s of subs) {
+            const span = s.querySelector('button > span');
+            if (span && span.textContent.trim().toLowerCase().includes(title.toLowerCase())) {
+                return s;
+            }
+        }
+        return null;
+    }
+
+    // Достать строки документов из под-секции (это grid-строки, а не <table>)
+    function documentRowsFromSubSection(subSection) {
+        if (!subSection) return [];
+        // CSS-селектор с квадратными скобками внутри значения класса работает
+        // нестабильно (Tailwind генерирует классы вида "grid-cols-[120px_...]").
+        // Поэтому перебираем все div'ы и фильтруем по className.
+        const allDivs = $$('div', subSection);
+        const rows = allDivs.filter(d => {
+            const c = d.className || '';
+            // Это именно строка-данные: содержит grid-cols-[120px и hover:bg-primary-50
+            return typeof c === 'string'
+                && c.includes('grid-cols-[120px')
+                && c.includes('hover:bg-primary-50');
+        });
+        return rows;
+    }
+
+    function parseDocumentRow(rowEl) {
+        // Структура строки документа (8 колонок):
+        // 0: id, 1: тип документа, 2: наименование, 3: серия, 4: номер, 5: дата выдачи, 6: статус, 7: файл
+        //
+        // В DOM прямые дети строки: <button> (absolute-full оверлей), <p>, <p>, <p>, <p>, <p>, <p>, <div> (статус), <div> (файл)
+        // Поэтому берём прямых детей-<p> по индексам.
+        const ps = $$(':scope > p', rowEl);
+        return {
+            id: txt(ps[0]),
+            type: txt(ps[1]),
+            name: txt(ps[2]),
+            series: txt(ps[3]),
+            number: txt(ps[4]),
+            date: txt(ps[5]),
+        };
+    }
+
+    function normalizePassportKind(kind) {
+        const text = String(kind || '').trim();
+        const lower = text.toLowerCase();
+        if (/иностран/.test(lower)) return 'Паспорт иностранного гражданина';
+        if (/паспорт/.test(lower) && /(россий|рф|rf)/i.test(text)) return 'Паспорт гражданина Российской Федерации';
+        return text;
+    }
+
+    function passportPriority(doc, citizenship = '') {
+        const kind = normalizePassportKind(doc?.type || doc?.kind || '');
+        const lower = kind.toLowerCase();
+        const isForeignCitizen = /иностран|казахстан|узбекистан|таджикистан|киргиз|кыргыз|армени|азербайджан|беларус|молдов|украин/i.test(citizenship || '');
+        if (isForeignCitizen && lower.includes('иностран')) return 0;
+        if (!isForeignCitizen && lower.includes('российской')) return 0;
+        if (lower.includes('российской')) return 1;
+        if (lower.includes('иностран')) return 1;
+        if (lower.includes('паспорт')) return 2;
+        return 9;
+    }
+
+    function passportSeriesText(passport) {
+        return passport?.series ? passport.series : '';
+    }
+
+    function passportConsentLine(passport) {
+        const parts = [
+            normalizePassportKind(passport?.kind) || 'Паспорт',
+            passport?.series ? `серия ${passport.series}` : '',
+            passport?.number ? `№ ${passport.number}` : '',
+        ].filter(Boolean);
+        return parts.join(', ');
+    }
+
+    // =====================================================================
+    // СБОР ДАННЫХ
+    // =====================================================================
+
+    function collectProfile() {
+        // Шапка профиля — там точно есть ФИО, ДР, СНИЛС, телефон, email
+        const fullName = txt($('div[title="ФИО"] span.text-lg'));
+        const birthday = txt($('div[title="День рождения"] span.text-lg'));
+        const snils = txt($('div[title="СНИЛС"] span.text-lg'));
+        const phone = txt($('div[title="Телефон"] span.text-lg'));
+        const email = txt($('div[title="Email"] span.text-lg'));
+
+        const [lastName = '', firstName = '', middleName = ''] = fullName.split(' ');
+
+        // Поля из карточки "Профиль"
+        const profileSec = sectionByTitle('Профиль');
+        const citizenship = valueByLabel('Гражданство', profileSec);
+        const gender = valueByLabel('Пол', profileSec);
+        const birthPlace = valueByLabel('Место рождения', profileSec);
+        const regAddress = valueByLabel('Адрес постоянной регистрации', profileSec);
+        const factAddress = valueByLabel('Адрес фактического проживания', profileSec) || regAddress;
+
+        // ID студента (из шапки)
+        const idEl = $('.opacity-60.text-nowrap');
+        const studentId = idEl ? idEl.textContent.replace(/[^\d]/g, '') : '';
+
+        // Категория поступающего ("Среднее общее", "Среднее профессиональное" и т.д.)
+        let category = '';
+        const catEl = Array.from(document.querySelectorAll('p')).find(p =>
+            p.textContent.includes('Категория поступающего:')
+        );
+        if (catEl) category = catEl.textContent.replace('Категория поступающего:', '').trim();
+
+        return {
+            studentId, fullName, lastName, firstName, middleName,
+            birthday, snils, phone, email,
+            citizenship, gender, birthPlace,
+            regAddress, factAddress,
+            category,
+        };
+    }
+
+    function collectPassport(citizenship = '') {
+        const sub = documentSubSection('Документы, удостоверяющие личность');
+        if (!sub) return {};
+        const rows = documentRowsFromSubSection(sub);
+        if (!rows.length) return {};
+        const docs = rows.map(parseDocumentRow);
+        const data = docs
+            .slice()
+            .sort((a, b) => passportPriority(a, citizenship) - passportPriority(b, citizenship))[0];
+        return {
+            kind: normalizePassportKind(data.type),
+            series: data.series,
+            number: data.number,
+            date: data.date,
+            issuedBy: '',              // на странице нет — соберём из модалки
+        };
+    }
+
+    function collectEducation() {
+        // Документы об образовании могут лежать в нескольких под-секциях:
+        // "Общее образование", "Среднее профессиональное образование",
+        // "Высшее образование", "Документ об образовании" и т.п.
+        // Соберём все под-секции внутри секции "Документы", в названии которых есть "образование".
+        const docsSec = sectionByTitle('Документы');
+        if (!docsSec) return [];
+
+        const subs = $$('section', docsSec).filter(s => {
+            const span = s.querySelector('button > span');
+            if (!span) return false;
+            const t = span.textContent.toLowerCase();
+            // НЕ "удостоверяющие личность", НЕ "индивидуальные достижения", НЕ "олимпиад"
+            if (t.includes('удостовер')) return false;
+            if (t.includes('достижен')) return false;
+            if (t.includes('олимпиад')) return false;
+            // ловим всё, что про образование
+            return t.includes('образован');
+        });
+
+        const result = [];
+        for (const sub of subs) {
+            const subTitle = txt(sub.querySelector('button > span'));
+            const rows = documentRowsFromSubSection(sub);
+            for (const row of rows) {
+                const d = parseDocumentRow(row);
+                // Пропускаем строки без серии и номера
+                if (!d.series && !d.number) continue;
+                result.push({
+                    section: subTitle,        // напр., "Общее образование"
+                    kind: d.type,             // напр., "Аттестат о среднем общем образовании"
+                    name: d.name,             // напр., "Аттестат"
+                    series: d.series,
+                    number: d.number,
+                    date: d.date,
+                });
+            }
+        }
+        return result;
+    }
+
+    function collectAchievements() {
+        // Ищем именно секцию достижений, чтобы не спутать ее с таблицами льгот/заявлений.
+        const sec = sectionByTitle('Индивидуальные достижения');
+        if (!sec) return [];
+
+        // Читаем заголовки колонок достижений и индексы
+        const achHeaders = [];
+        $$('.ant-table-thead th', sec).forEach((th, idx) => {
+            if ((th.className || '').includes('border-l')) {
+                const nameSpan = th.querySelector('.font-semibold');
+                achHeaders.push({ idx, name: txt(nameSpan) });
+            }
+        });
+        if (!achHeaders.length) return [];
+
+        // Для каждой колонки собираем максимальный/любой ненулевой балл
+        const scores = new Map(); // name -> score string
+        $$('.ant-table-tbody tr.ant-table-row', sec).forEach(tr => {
+            const tds = $$(':scope > td', tr);
+            achHeaders.forEach(col => {
+                if (scores.has(col.name)) return;
+                const td = tds[col.idx];
+                if (!td) return;
+                const scoreEl = td.querySelector('p[class*="w-"]') || td.querySelector('p');
+                const v = scoreEl ? txt(scoreEl).trim() : txt(td).trim();
+                if (v && v !== '-' && v !== '0' && /\d/.test(v)) {
+                    scores.set(col.name, v);
+                }
+            });
+        });
+
+        return achHeaders
+            .filter(col => scores.has(col.name))
+            .map(col => ({ name: col.name, score: scores.get(col.name) }));
+    }
+
+    function collectOlympiads() {
+        const sub = documentSubSection('Документы, подтверждающие участие в олимпиаде');
+        if (!sub) return [];
+        const rows = documentRowsFromSubSection(sub);
+        return rows.map(parseDocumentRow);
+    }
+
+    function collectBenefits() {
+        const sec = sectionByTitle('Особые права');
+        if (!sec) return [];
+        if (sec.querySelector('.ant-empty')) return [];
+
+        // Читаем заголовки benefit-колонок (class содержит "border-l")
+        // Каждый такой th содержит: span.font-semibold (тип квоты) + span с серым текстом (название документа)
+        const benefitHeaders = [];
+        $$('.ant-table-thead th', sec).forEach((th, idx) => {
+            if ((th.className || '').includes('border-l')) {
+                const quotaSpan = th.querySelector('.font-semibold');
+                const docSpan   = th.querySelector('.text-gray-400, [class*="text-gray"]');
+                benefitHeaders.push({
+                    idx,
+                    quotaType: txt(quotaSpan),
+                    docName:   txt(docSpan),
+                });
+            }
+        });
+
+        const result = [];
+        $$('.ant-table-tbody tr.ant-table-row', sec).forEach(tr => {
+            const tds = $$(':scope > td', tr);
+
+            // Тип квоты берём из ячейки с классом "before:hidden"
+            const quotaTd   = tds.find(td => (td.className || '').includes('before:hidden'));
+            const quotaType = quotaTd ? txt(quotaTd) : '';
+
+            if (benefitHeaders.length) {
+                benefitHeaders.forEach(col => {
+                    const td = tds[col.idx];
+                    if (!td) return;
+                    // Подтверждено, если есть элемент .text-success или текст содержит "да/учтено"
+                    const confirmed = td.querySelector('.text-success') || /да|учтено/i.test(txt(td));
+                    if (confirmed) {
+                        result.push({
+                            name:      col.docName  || col.quotaType || quotaType || 'Льгота',
+                            quotaType: col.quotaType || quotaType,
+                        });
+                    }
+                });
+            } else if (quotaType) {
+                // Запасной вариант — нет явных benefit-колонок
+                result.push({ name: quotaType, quotaType });
+            }
+        });
+
+        // Убираем дубли
+        const seen = new Set();
+        return result.filter(b => {
+            const key = b.name + '|' + b.quotaType;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    function collectEntranceExams() {
+        const sec = sectionByTitle('Вступительные испытания');
+        if (!sec) return { enrollments: [], egeResults: [] };
+
+        const rows = $$('.ant-table-tbody tr.ant-table-row', sec);
+        const enrollments = [];
+        const egeResults = [];
+
+        rows.forEach(tr => {
+            const tds = $$(':scope > td.ant-table-cell', tr);
+            if (tds.length < 4) return;
+
+            const subject = txt(tds[0].querySelector('p') || tds[0]);
+
+            const typeEl = tds[1].querySelector('.space-y-1');
+            const typeInfo = typeEl
+                ? typeEl.textContent.replace(/\s+/g, ' ').trim()
+                : txt(tds[1]);
+
+            // Дата/время записи на ВИ — только p.text-secondary (без кабинета)
+            const dateEl = tds[2].querySelector('p.text-secondary');
+            if (dateEl) {
+                const dt = txt(dateEl);
+                if (dt) {
+                    // VVI score from col 4 (Результат ВВИ), same structure as EGE col
+                    let vviScore = '';
+                    if (tds.length > 4) {
+                        const vviDiv = $$('div', tds[4]).find(d => {
+                            const c = d.className || '';
+                            return c.includes('flex-col') && c.includes('items-center');
+                        });
+                        if (vviDiv) {
+                            const raw = txt(vviDiv.querySelector('p')).trim();
+                            if (raw && /^\d+([.,]\d+)?$/.test(raw)) vviScore = raw;
+                        }
+                    }
+                    enrollments.push({ subject, typeInfo, datetime: dt, vviScore });
+                }
+            }
+
+            // Результат ЕГЭ — первый <p> внутри div с классами flex-col и items-center
+            const allDivs = $$('div', tds[3]);
+            const scoreDiv = allDivs.find(d => {
+                const c = d.className || '';
+                return c.includes('flex-col') && c.includes('items-center');
+            });
+            if (scoreDiv) {
+                const firstP = scoreDiv.querySelector('p');
+                const score = firstP ? txt(firstP).trim() : '';
+                if (score && /^\d+$/.test(score)) {
+                    egeResults.push({ subject, score });
+                }
+            }
+        });
+
+        return { enrollments, egeResults };
+    }
+
+    // Определить уровень образования по коду направления
+    // Код вида X.YY.ZZ.WW или YY.ZZ.WW, где ZZ — уровень:
+    // 02 (СПО), 03 (бакалавриат), 04 (магистратура), 05 (специалитет), 06/07 (аспирантура)
+    function detectLevel(directionCode) {
+        const m = (directionCode || '').match(/\d+(?:\.\d+){2,3}/);
+        if (!m) return { name: '', accessLevel: '' };
+        const parts = m[0].split('.');
+        const lvl = parts.length >= 4 ? parts[2] : parts[1];
+        const map = {
+            '02': { name: 'Среднее профессиональное', accessLevel: 'spo' },
+            '03': { name: 'Бакалавриат', accessLevel: 'bachelor' },
+            '04': { name: 'Магистратура', accessLevel: 'master' },
+            '05': { name: 'Специалитет', accessLevel: 'specialist' },
+            '06': { name: 'Аспирантура', accessLevel: 'postgrad' },
+            '07': { name: 'Аспирантура', accessLevel: 'postgrad' },
+        };
+        return map[lvl] || { name: '', accessLevel: '' };
+    }
+
+    function collectApplications() {
+        // Каждое заявление — это section внутри секции "Заявления"
+        const appsSec = sectionByTitle('Заявления');
+        if (!appsSec) return [];
+
+        // Заявления — это под-секции вида "ЗАЯВЛЕНИЕ № 250025"
+        const subSections = $$('section', appsSec).filter(s => {
+            const btn = s.querySelector('button > div');
+            return btn && /заявление/i.test(btn.textContent) && /№/.test(btn.textContent);
+        });
+
+        const apps = [];
+        for (const s of subSections) {
+            const header = s.querySelector('button');
+            const headerText = header ? header.textContent : '';
+            const numMatch = headerText.match(/№\s*(\d+)/);
+            const isBudget = /бюджетные/i.test(headerText);
+            const isPaid = /платные/i.test(headerText);
+
+            // Дата регистрации, источник, ЕПГУ id
+            const regDate = valueByLabel('Дата регистрации', s);
+            const source = valueByLabel('Источник', s);
+            const epguId = valueByLabel('ЕПГУ id', s);
+
+            // Конкурсные группы — это таблица antd
+            const competitions = $$('.ant-table-tbody tr.ant-table-row', s).map(tr => {
+                const tds = $$(':scope > td', tr);
+
+                // Форма обучения: если tds[5] содержит известное значение формы
+                const form5 = txt(tds[5]);
+                const form = /^(Очная|Заочная|Очно.заочная)$/i.test(form5) ? form5 : '';
+
+                // Статус = fix-end ячейка С тенью (shadow), Приоритет = fix-end ячейка БЕЗ тени
+                // Это работает для любого числа колонок (бюджет, платное, старая/новая структуры)
+                const statusTd   = tds.find(td => {
+                    const c = td.className || '';
+                    return c.includes('ant-table-cell-fix-end') && c.includes('fix-end-shadow');
+                });
+                const priorityTd = tds.find(td => {
+                    const c = td.className || '';
+                    return c.includes('ant-table-cell-fix-end') && !c.includes('fix-end-shadow');
+                });
+
+                // Вид мест = последняя обычная (не fix) ячейка перед ячейкой статуса
+                let placeType = '';
+                if (statusTd) {
+                    const sIdx = tds.indexOf(statusTd);
+                    for (let i = sIdx - 1; i >= 0; i--) {
+                        const c = tds[i].className || '';
+                        if (!c.includes('fix-end') && !c.includes('fix-start')) {
+                            placeType = txt(tds[i]);
+                            break;
+                        }
+                    }
+                } else {
+                    placeType = form ? txt(tds[6]) : (isBudget ? txt(tds[5]) : txt(tds[6]));
+                }
+
+                return {
+                    kgId:          txt(tds[0]),
+                    competitionId: txt(tds[1]),
+                    organization:  txt(tds[2]),
+                    direction:     txt(tds[3]),
+                    program:       txt(tds[4]),
+                    form,
+                    placeType,
+                    status:   statusTd   ? txt(statusTd)   : (form ? txt(tds[7]) : (isBudget ? txt(tds[6]) : txt(tds[7]))),
+                    priority: priorityTd ? txt(priorityTd) : (form ? txt(tds[8]) : (isBudget ? txt(tds[7]) : txt(tds[8]))),
+                };
+            });
+
+            apps.push({
+                number: numMatch ? numMatch[1] : '',
+                kind: isBudget ? 'budget' : (isPaid ? 'paid' : 'unknown'),
+                regDate, source, epguId,
+                competitions,
+            });
+        }
+        return apps;
+    }
+
+    function collectAll() {
+        const profile = collectProfile();
+        return {
+            profile,
+            passport: collectPassport(profile.citizenship),
+            education: collectEducation(),
+            achievements: collectAchievements(),
+            olympiads: collectOlympiads(),
+            benefits: collectBenefits(),
+            applications: collectApplications(),
+            entranceExams: collectEntranceExams(),
+        };
+    }
+
+    // =====================================================================
+    // МОДАЛКА ДЛЯ ВВОДА НЕДОСТАЮЩИХ ДАННЫХ
+    // =====================================================================
+
+    function openModal(data, onSubmit) {
+        // Удаляем предыдущую модалку, если осталась
+        const old = document.getElementById('ggu-doc-modal');
+        if (old) old.remove();
+
+        const profile = data.profile;
+        const savedManual = loadManual(profile);
+        const savedRep = savedManual.representative || {};
+        const isMinor = (() => {
+            if (!profile.birthday) return false;
+            const m = profile.birthday.match(/(\d{2})\.(\d{2})\.(\d{4})/);
+            if (!m) return false;
+            const bd = new Date(`${m[3]}-${m[2]}-${m[1]}`);
+            const age = (Date.now() - bd.getTime()) / (365.25 * 24 * 3600 * 1000);
+            return age < 18;
+        })();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'ggu-doc-modal';
+        overlay.innerHTML = `
+            <style>
+                #ggu-doc-modal {
+                    position: fixed; inset: 0; z-index: 99999;
+                    background: rgba(0,0,0,0.45);
+                    display: flex; align-items: center; justify-content: center;
+                    font-family: Arial, sans-serif;
+                }
+                #ggu-doc-modal .modal {
+                    background: #fff; border-radius: 12px;
+                    max-width: 720px; width: 92%;
+                    max-height: 90vh; overflow-y: auto;
+                    padding: 24px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                }
+                #ggu-doc-modal h2 { margin: 0 0 16px; font-size: 18px; color: #333; }
+                #ggu-doc-modal h3 { margin: 16px 0 8px; font-size: 14px; color: #636C8D; text-transform: uppercase; }
+                #ggu-doc-modal .row { display: flex; gap: 12px; margin-bottom: 10px; }
+                #ggu-doc-modal label { flex: 1; display: flex; flex-direction: column; font-size: 13px; color: #555; }
+                #ggu-doc-modal input, #ggu-doc-modal select, #ggu-doc-modal textarea {
+                    margin-top: 4px; padding: 8px 10px;
+                    border: 1px solid #d9d9d9; border-radius: 6px;
+                    font-size: 14px; font-family: inherit;
+                }
+                #ggu-doc-modal input:focus, #ggu-doc-modal select:focus {
+                    outline: none; border-color: #636C8D;
+                }
+                #ggu-doc-modal .actions {
+                    display: flex; gap: 12px; justify-content: flex-end;
+                    margin-top: 20px; padding-top: 16px;
+                    border-top: 1px solid #eee;
+                }
+                #ggu-doc-modal button {
+                    padding: 10px 20px; border-radius: 8px;
+                    border: none; cursor: pointer; font-size: 14px; font-weight: 600;
+                }
+                #ggu-doc-modal .btn-primary { background: #636C8D; color: #fff; }
+                #ggu-doc-modal .btn-secondary { background: #f0f0f0; color: #333; }
+                #ggu-doc-modal .hint { font-size: 12px; color: #999; margin-top: 2px; }
+                #ggu-doc-modal .preset { color: #636C8D; font-size: 12px; cursor: pointer; }
+                #ggu-doc-modal .checkbox-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+            </style>
+            <div class="modal">
+                <h2>Уточните данные для формирования заявления</h2>
+                <p style="margin: 0 0 16px; font-size: 13px; color: #666;">
+                    Поля, которых нет на странице профиля. Подставленные значения можно править.
+                </p>
+
+                <h3>Паспорт</h3>
+                <label>Кем выдан и когда (полностью)
+                    <input type="text" id="m-passport-issuedBy" value="${escapeHtml(savedManual.passportIssuedBy || '')}" placeholder="ОУФМС России по г. Москве, 22.03.2021">
+                    <span class="hint">Например: «Отделом УФМС России по гор. Москве в р-не Кузьминки, 22.03.2021»</span>
+                </label>
+
+                <h3>Профиль</h3>
+                <div class="row">
+                    <label>Место рождения
+                        <input type="text" id="m-birthPlace" value="${escapeHtml(savedManual.birthPlace || profile.birthPlace)}">
+                    </label>
+                    <label>Иностранный язык
+                        <select id="m-foreignLang">
+                            <option value="" ${!savedManual.foreignLang ? 'selected' : ''}>не изучал/не указал</option>
+                            <option ${savedManual.foreignLang === 'Английский' ? 'selected' : ''}>Английский</option>
+                            <option ${savedManual.foreignLang === 'Немецкий' ? 'selected' : ''}>Немецкий</option>
+                            <option ${savedManual.foreignLang === 'Французский' ? 'selected' : ''}>Французский</option>
+                            <option ${savedManual.foreignLang === 'Испанский' ? 'selected' : ''}>Испанский</option>
+                            <option ${savedManual.foreignLang === 'Китайский' ? 'selected' : ''}>Китайский</option>
+                        </select>
+                    </label>
+                </div>
+
+                <h3>Образование</h3>
+                <label>Образовательное учреждение, выдавшее документ
+                    <input type="text" id="m-eduIssuer" value="${escapeHtml(savedManual.eduIssuer || '')}" placeholder="МБОУ Гимназия № 1 г. Люберцы">
+                </label>
+
+                <h3>Общежитие</h3>
+                <div class="checkbox-row">
+                    <input type="radio" id="m-hostel-no" name="hostel" value="0" ${!savedManual.needsHostel ? 'checked' : ''}>
+                    <label for="m-hostel-no" style="flex-direction: row;">Не нуждаюсь</label>
+                </div>
+                <div class="checkbox-row">
+                    <input type="radio" id="m-hostel-yes" name="hostel" value="1" ${savedManual.needsHostel ? 'checked' : ''}>
+                    <label for="m-hostel-yes" style="flex-direction: row;">Нуждаюсь (с Порядком проживания ознакомлен(а))</label>
+                </div>
+
+                ${isMinor ? `
+                <h3>Законный представитель (поступающий несовершеннолетний)</h3>
+                <label>ФИО законного представителя
+                    <input type="text" id="m-rep-name" value="${escapeHtml(savedRep.name || '')}">
+                </label>
+                <div class="row">
+                    <label>Документ
+                        <input type="text" id="m-rep-doc" value="${escapeHtml(savedRep.doc || 'Паспорт гражданина РФ')}">
+                    </label>
+                    <label>Серия
+                        <input type="text" id="m-rep-series" value="${escapeHtml(savedRep.series || '')}">
+                    </label>
+                    <label>Номер
+                        <input type="text" id="m-rep-number" value="${escapeHtml(savedRep.number || '')}">
+                    </label>
+                </div>
+                <label>Кем и когда выдан
+                    <input type="text" id="m-rep-issued" value="${escapeHtml(savedRep.issued || '')}">
+                </label>
+                ` : ''}
+
+                <h3>Дополнительно</h3>
+                <label>Регистрационный номер заявления (опционально)
+                    <input type="text" id="m-regNum" value="${escapeHtml(savedManual.regNumber || '')}" placeholder="оставьте пустым для пропуска">
+                </label>
+
+                <div class="actions">
+                    <button class="btn-secondary" id="m-cancel">Отмена</button>
+                    <button class="btn-primary" id="m-ok">Сформировать заявление</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        const close = () => overlay.remove();
+        overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+        $('#m-cancel', overlay).addEventListener('click', close);
+        $('#m-ok', overlay).addEventListener('click', () => {
+            const manual = {
+                passportIssuedBy: $('#m-passport-issuedBy', overlay).value.trim(),
+                birthPlace: $('#m-birthPlace', overlay).value.trim(),
+                foreignLang: $('#m-foreignLang', overlay).value.trim(),
+                eduIssuer: $('#m-eduIssuer', overlay).value.trim(),
+                needsHostel: $('input[name="hostel"]:checked', overlay).value === '1',
+                regNumber: $('#m-regNum', overlay).value.trim(),
+                representative: isMinor ? {
+                    name: $('#m-rep-name', overlay).value.trim(),
+                    doc: $('#m-rep-doc', overlay).value.trim(),
+                    series: $('#m-rep-series', overlay).value.trim(),
+                    number: $('#m-rep-number', overlay).value.trim(),
+                    issued: $('#m-rep-issued', overlay).value.trim(),
+                } : null,
+            };
+            saveManual(profile, manual);
+            close();
+            onSubmit(manual);
+        });
+    }
+
+    // =====================================================================
+    // ГЕНЕРАЦИЯ ЗАЯВЛЕНИЯ (HTML по XSLT-шаблону)
+    // =====================================================================
+
+    function generateApplicationHTML(data, manual) {
+        const p = data.profile;
+        const pass = data.passport;
+        const edu = data.education;
+        const apps = data.applications;
+        const ach = data.achievements;
+        const benefits = data.benefits;
+        const { enrollments, egeResults } = data.entranceExams || { enrollments: [], egeResults: [] };
+
+        // Определяем уровень образования по первому конкурсу первого заявления
+        const firstComp = apps[0]?.competitions?.[0];
+        const level = firstComp ? detectLevel(firstComp.direction) : { name: '', accessLevel: '' };
+
+        // Разделяем конкурсные группы на бюджетные и платные, сортируем по приоритету
+        const allCompetitions = [];
+        for (const app of apps) {
+            for (const c of app.competitions) {
+                allCompetitions.push({ ...c, appKind: app.kind });
+            }
+        }
+
+        const hasBudget = allCompetitions.some(c => c.appKind === 'budget');
+        const hasPaid = allCompetitions.some(c => c.appKind === 'paid');
+
+        const budgetComps = allCompetitions
+            .filter(c => c.appKind === 'budget')
+            .sort((a, b) => parseInt(a.priority || '99') - parseInt(b.priority || '99'));
+
+        // Для магистратуры/аспирантуры не показываем колонки квот
+        const isMasterOrPostgrad = budgetComps.length > 0 && budgetComps.every(c => {
+            const lvl = detectLevel(c.direction).accessLevel;
+            return lvl === 'master' || lvl === 'postgrad';
+        });
+        const paidComps = allCompetitions
+            .filter(c => c.appKind === 'paid')
+            .sort((a, b) => parseInt(a.priority || '99') - parseInt(b.priority || '99'));
+
+        const currentYear = new Date().getFullYear();
+        const today = new Date().toLocaleDateString('ru-RU');
+        const tick = '✓'; // вместо AdmGraphics/tick.png
+
+        // ---- Шапка ----
+        const headerHTML = `
+            <div class="reg-num">Регистрационный № <u>${escapeHtml(manual.regNumber || '_______')} / ${escapeHtml(p.studentId)}</u></div>
+            <table style="width:100%; border:none; margin: 10px 0;">
+                <tr><td style="width:55%; border:none;">&nbsp;</td>
+                    <td style="border:none; font-weight:bold; font-size:10pt;">
+                        Ректору ФГБОУ ВО<br>
+                        «Гжельский государственный университет»<br>
+                        Сомову Д.С.
+                    </td>
+                </tr>
+            </table>
+        `;
+
+        // ---- Персональные данные ----
+        const personalTable = `
+            <table class="t bordered">
+                <tr>
+                    <td width="20%"><b>Фамилия</b></td>
+                    <td width="28%"><i>${escapeHtml(p.lastName)}</i></td>
+                    <td colspan="4"><b>Документ, удостоверяющий личность</b></td>
+                    <td width="25%"><i>${escapeHtml(normalizePassportKind(pass.kind) || '')}</i></td>
+                </tr>
+                <tr>
+                    <td><b>Имя</b></td>
+                    <td><i>${escapeHtml(p.firstName)}</i></td>
+                    <td width="7%"><b>Серия</b></td>
+                    <td width="13%"><i>${escapeHtml(passportSeriesText(pass))}</i></td>
+                    <td width="10%"><b>Номер</b></td>
+                    <td colspan="2"><i>${escapeHtml(pass.number || '')}</i></td>
+                </tr>
+                <tr>
+                    <td><b>Отчество</b></td>
+                    <td><i>${escapeHtml(p.middleName)}</i></td>
+                    <td colspan="2"><b>Когда и кем выдан</b></td>
+                    <td colspan="3"><i>${escapeHtml(pass.date || '')} ${escapeHtml(manual.passportIssuedBy || '')}</i></td>
+                </tr>
+                <tr>
+                    <td><b>Дата рождения</b></td>
+                    <td><i>${escapeHtml(p.birthday)}</i></td>
+                    <td colspan="5" rowspan="3"><i>${escapeHtml(manual.birthPlace || '')}</i></td>
+                </tr>
+                <tr><td><b>Гражданство</b></td><td><i>${escapeHtml(p.citizenship)}</i></td></tr>
+                <tr><td><b>СНИЛС</b></td><td><i>${escapeHtml(p.snils)}</i></td></tr>
+                <tr>
+                    <td><b>Адрес постоянной регистрации</b></td>
+                    <td colspan="6"><i>${escapeHtml(p.regAddress)}</i></td>
+                </tr>
+                <tr>
+                    <td><b>Адрес фактического проживания</b></td>
+                    <td colspan="6"><i>${escapeHtml(p.factAddress)}</i></td>
+                </tr>
+                <tr>
+                    <td><b>Контактный телефон</b></td>
+                    <td colspan="6"><i>${escapeHtml(p.phone)}</i></td>
+                </tr>
+                <tr>
+                    <td><b>Электронная почта</b></td>
+                    <td colspan="6"><i>${escapeHtml(p.email)}</i></td>
+                </tr>
+            </table>
+        `;
+
+        // ---- Образование ----
+        // Маппинг названия под-секции на отображаемый уровень
+        const eduLevelFromSection = (sectionTitle) => {
+            const t = (sectionTitle || '').toLowerCase();
+            if (t.includes('основное общее')) return 'Основное общее';
+            if (t.includes('общее')) return 'Среднее общее';
+            if (t.includes('среднее профессиональное')) return 'Среднее профессиональное';
+            if (t.includes('высшее')) return 'Высшее';
+            return sectionTitle || 'Образование';
+        };
+
+        // Если массив пустой — рисуем одну пустую строку с прочерками
+        const eduList = (edu && edu.length) ? edu : [{ section: '', series: '', number: '', date: '' }];
+
+        const educationBlock = `
+            <div class="text-small" style="margin-top:10px;">
+                В Приёмную комиссию представлен(ы) документ(ы) об образовании:
+            </div>
+            <table class="t bordered" style="text-align:center; margin-top:8px;">
+                <tr>
+                    <td width="35%"><b>Уровень / тип документа</b></td>
+                    <td width="20%"><b>Серия</b></td>
+                    <td width="25%"><b>Номер</b></td>
+                    <td width="20%"><b>Дата выдачи</b></td>
+                </tr>
+                ${eduList.map(e => `
+                <tr>
+                    <td style="text-align:left; padding-left:6px;">${escapeHtml(eduLevelFromSection(e.section))}${e.kind ? ` <small>(${escapeHtml(e.kind)})</small>` : ''}</td>
+                    <td>${escapeHtml(e.series || '—')}</td>
+                    <td>${escapeHtml(e.number || '—')}</td>
+                    <td>${escapeHtml(e.date || '—')}</td>
+                </tr>`).join('')}
+            </table>
+            <div class="text-small" style="text-align:center; border-bottom:1px solid #000; margin-top:6px;">
+                Выдан ${escapeHtml(manual.eduIssuer || '__________________________________________')}
+            </div>
+            <div class="text-tiny" style="text-align:center;"><sub>(название образовательного учреждения)</sub></div>
+        `;
+
+        // ---- Таблица бюджетных направлений ----
+        const renderBudgetRow = (c, idx) => {
+            const lvlInfo = detectLevel(c.direction);
+            const levelName = lvlInfo.name || '—';
+            return `
+                <tr>
+                    <td style="text-align:center;">${escapeHtml(c.priority || String(idx + 1))}</td>
+                    <td style="font-size:9pt;">${escapeHtml(c.direction)}${c.program ? `<br><small>${escapeHtml(c.program)}</small>` : ''}</td>
+                    <td style="text-align:center; font-size:9pt;">${escapeHtml(levelName)}</td>
+                    <td style="text-align:center; font-size:9pt;">${escapeHtml(c.form || extractForm(c.direction))}</td>
+                    ${!isMasterOrPostgrad ? `<td style="text-align:center;">${/отд[её]льн/i.test(c.placeType) ? tick : ''}</td>
+                    <td style="text-align:center;">${/особ/i.test(c.placeType) ? tick : ''}` + '</td>' : ''}
+                    <td style="text-align:center;">${/основн|общ.*конкурс|^общ/i.test(c.placeType) ? tick : ''}</td>
+                    ${!isMasterOrPostgrad ? `<td style="text-align:center;">${/целев/i.test(c.placeType) ? tick : ''}</td>` : ''}
+                </tr>
+            `;
+        };
+
+        const budgetTable = hasBudget ? `
+            <table class="t bordered">
+                <tr>
+                    <td rowspan="3" width="8%" style="text-align:center; vertical-align:middle;"><b>№<br>приоритета</b></td>
+                    <td rowspan="3" width="32%" style="text-align:center; vertical-align:middle;"><b>Направление подготовки / специальность</b></td>
+                    <td rowspan="3" width="11%" style="text-align:center; vertical-align:middle;"><b>Уровень</b></td>
+                    <td rowspan="3" width="11%" style="text-align:center; vertical-align:middle;"><b>Форма обучения</b></td>
+                    <td colspan="${isMasterOrPostgrad ? 1 : 4}" style="text-align:center;"><b>В рамках контрольных цифр приёма:</b></td>
+                </tr>
+                <tr>
+                    <td colspan="${isMasterOrPostgrad ? 1 : 4}" style="text-align:center;"><b>В рамках КЦП</b></td>
+                </tr>
+                <tr>
+                    ${!isMasterOrPostgrad ? '<td style="text-align:center; font-size:8pt;">Отд.квота</td><td style="text-align:center; font-size:8pt;">в пределах особой квоты</td>' : ''}
+                    <td style="text-align:center; font-size:8pt;">основные места / общий конкурс</td>
+                    ${!isMasterOrPostgrad ? '<td style="text-align:center; font-size:8pt;">целевая квота</td>' : ''}
+                </tr>
+                ${budgetComps.map(renderBudgetRow).join('')}
+            </table>
+        ` : '';
+
+        // ---- Таблица платных направлений ----
+        const renderPaidRow = (c, idx) => {
+            const lvlInfo = detectLevel(c.direction);
+            const levelName = lvlInfo.name || '—';
+            return `
+                <tr>
+                    <td style="text-align:center;">${escapeHtml(c.priority || String(idx + 1))}</td>
+                    <td style="font-size:9pt;">${escapeHtml(c.direction)}${c.program ? `<br><small>${escapeHtml(c.program)}</small>` : ''}</td>
+                    <td style="text-align:center; font-size:9pt;">${escapeHtml(levelName)}</td>
+                    <td style="text-align:center; font-size:9pt;">${escapeHtml(c.form || extractForm(c.direction))}</td>
+                    <td style="text-align:center;">${tick}</td>
+                </tr>
+            `;
+        };
+
+        const paidTable = hasPaid ? `
+            <table class="t bordered" style="margin-top:8px;">
+                <tr>
+                    <td width="8%" style="text-align:center; vertical-align:middle;"><b>№<br>приоритета</b></td>
+                    <td width="35%" style="text-align:center; vertical-align:middle;"><b>Направление подготовки / специальность</b></td>
+                    <td width="12%" style="text-align:center; vertical-align:middle;"><b>Уровень</b></td>
+                    <td width="12%" style="text-align:center; vertical-align:middle;"><b>Форма обучения</b></td>
+                    <td style="text-align:center; vertical-align:middle;"><b>По договору об оказании платных образовательных услуг</b></td>
+                </tr>
+                ${paidComps.map(renderPaidRow).join('')}
+            </table>
+        ` : '';
+
+        // ---- Результаты ЕГЭ ----
+        const egeBlock = egeResults.length ? `
+            <div style="margin-top:10px;"><b>1.&nbsp;&nbsp;Прошу зачислить в качестве результатов вступительных испытаний следующие результаты ЕГЭ/ЦТ РБ</b></div>
+            <table class="t bordered">
+                <tr style="text-align:center;">
+                    <td width="5%"><b>№</b></td>
+                    <td width="40%"><b>Наименование предмета</b></td>
+                    <td width="15%"><b>Результат (балл)</b></td>
+                </tr>
+                ${egeResults.map((r, i) => `
+                <tr>
+                    <td style="text-align:center;">${i + 1}</td>
+                    <td>${escapeHtml(r.subject)}</td>
+                    <td style="text-align:center;">${escapeHtml(r.score)}</td>
+                </tr>`).join('')}
+            </table>
+        ` : '';
+
+        // ---- Запись на вступительные испытания ----
+        const viEnrollNum = egeResults.length ? 2 : 1;
+        const viBlock = enrollments.length ? `
+            <div style="margin-top:10px;"><b>${viEnrollNum}.&nbsp;&nbsp;Прошу допустить к сдаче вступительных испытаний в ГГУ по следующим предметам:</b></div>
+            <table class="t bordered">
+                <tr style="text-align:center;">
+                    <td width="5%"><b>№</b></td>
+                    <td width="30%"><b>Наименование предмета</b></td>
+                    <td width="40%"><b>Тип ВИ</b></td>
+                    <td width="25%"><b>Дата и время</b></td>
+                </tr>
+                ${enrollments.map((r, i) => `
+                <tr>
+                    <td style="text-align:center;">${i + 1}</td>
+                    <td>${escapeHtml(r.subject)}</td>
+                    <td>Внутреннее вступительное испытание</td>
+                    <td style="text-align:center;">${escapeHtml(r.datetime)}</td>
+                </tr>`).join('')}
+            </table>
+        ` : '';
+
+        // Динамическая нумерация следующих разделов
+        const prevSections = (egeResults.length ? 1 : 0) + (enrollments.length ? 1 : 0);
+        const benefitsNum = prevSections + 1;
+        const achNum = prevSections + (hasBudget && benefits.length ? 2 : 1);
+
+        // ---- Льготы ----
+        const benefitsBlock = hasBudget && benefits.length ? `
+            <div style="margin-top:10px;"><b>${benefitsNum}.&nbsp;&nbsp;Право на обучение за счёт бюджетных ассигнований</b>
+                <small>(копии документов прилагаются к заявлению)</small>
+            </div>
+            <table class="t bordered">
+                <tr style="text-align:center;">
+                    <td width="55%"><b>Право на льготы</b></td>
+                    <td width="10%"><b>Имею</b></td>
+                    <td width="35%"><b>Тип льготы</b></td>
+                </tr>
+                ${benefits.map(b => `
+                <tr>
+                    <td>${escapeHtml(b.name)}</td>
+                    <td style="text-align:center;">${tick}</td>
+                    <td style="text-align:center;">${escapeHtml(b.quotaType)}</td>
+                </tr>`).join('')}
+            </table>
+        ` : '';
+
+        // ---- Индивидуальные достижения ----
+        const achBlock = ach.length ? `
+            <div style="margin-top:10px;"><b>${achNum}. Индивидуальные достижения</b>
+                <small>(копии документов прилагаются к заявлению)</small>
+            </div>
+            <table class="t bordered">
+                <tr style="text-align:center;">
+                    <td width="5%"><b>№</b></td>
+                    <td width="75%"><b>Наименование достижения</b></td>
+                    <td width="20%"><b>Количество баллов</b></td>
+                </tr>
+                ${ach.map((a, i) => `
+                <tr>
+                    <td style="text-align:center;">${i + 1}</td>
+                    <td>${escapeHtml(a.name)}</td>
+                    <td style="text-align:center;">${escapeHtml(a.score || '')}</td>
+                </tr>`).join('')}
+            </table>
+        ` : '';
+
+        // ---- Общежитие ----
+        const hostelBlock = `
+            <div style="margin-top:10px;">
+                В общежитии&nbsp;&nbsp;
+                ${!manual.needsHostel ? `${tick} не нуждаюсь` : `${tick} нуждаюсь&nbsp;&nbsp;${tick} с Порядком проживания ознакомлен(а)`}
+            </div>
+        `;
+
+        // ---- Блок ознакомления ----
+        const acknowledgeBlock = `
+            <table class="t dashed" style="margin-top:10px;">
+                <tr>
+                    <td><div><b>Ознакомлен(а)</b> (в том числе через информационные системы общего пользования) с:</div></td>
+                    <td width="15%" style="text-align:center;"><div><b>Подтверждаю</b></div></td>
+                </tr>
+                <tr><td>— копиями устава и лицензии на осуществление образовательной деятельности (с приложениями)</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td>— копией свидетельства о государственной аккредитации (с приложениями)</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td>— Правилами приёма в ГГУ в ${currentYear} году</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td>— информацией о предоставляемых особых правах и преимуществах при приёме на обучение</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td>— датой завершения приёма заявлений о согласии на зачисление</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                ${hasPaid ? `<tr><td>— датой заключения договора об образовании</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>` : ''}
+                <tr><td>— правилами подачи апелляции при проведении вступительных испытаний</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td><b>Подтверждаю:</b> достоверность сведений в заявлении о себе</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td>— подачу заявления не более чем в пять вузов (учитывая заявление в ГГУ)</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td>— отсутствие у поступающего диплома бакалавра, специалиста, магистра (для бакалавриата/специалитета)</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+                <tr><td><b>Обязуюсь:</b> при необходимости предоставить свидетельство о признании иностранного образования</td><td style="text-align:center; font-size:14pt;">${tick}</td></tr>
+            </table>
+        `;
+
+        // ---- Иностранный язык ----
+        const langBlock = `
+            <div style="margin-top:10px;">
+                <b>Иностранный язык:</b>&nbsp;&nbsp;
+                ${manual.foreignLang ? `${tick} ${escapeHtml(manual.foreignLang)}` : 'не изучал / не указал'}
+            </div>
+        `;
+
+        // ---- Представитель (если несовершеннолетний) ----
+        const repBlock = manual.representative && manual.representative.name ? `
+            <div style="margin-top:10px; padding:8px; border:1px solid #999;">
+                <b>Законный представитель:</b><br>
+                ФИО: ${escapeHtml(manual.representative.name)}<br>
+                ${escapeHtml(manual.representative.doc)}, серия ${escapeHtml(manual.representative.series)},
+                № ${escapeHtml(manual.representative.number)}, выдан ${escapeHtml(manual.representative.issued)}
+            </div>
+        ` : '';
+
+        // ---- Финальный HTML ----
+        const html = `<!DOCTYPE html>
+<html lang="ru"><head>
+<meta charset="UTF-8">
+<title>Заявление № ${escapeHtml(manual.regNumber || p.studentId)}</title>
+<style>
+@page { size: A4; margin: 12mm; }
+body {
+    width: 180mm; margin: 10px auto;
+    font-family: Arial, sans-serif; font-size: 11pt;
+    color: #000; background: #fff;
+}
+.reg-num { font-size: 10pt; font-weight: bold; }
+.t { width: 100%; border-collapse: collapse; }
+.t.bordered td, .t.bordered th { border: 1px solid #000; padding: 4px 6px; vertical-align: middle; }
+.t.dashed td { border: 1px dashed #555; padding: 4px 6px; }
+.text-small { font-size: 10pt; }
+.text-tiny { font-size: 8pt; color: #555; }
+.hint { font-size: 8pt; color: #c80; }
+h1.title {
+    text-align: center; font-size: 13pt; font-weight: bold;
+    margin: 14px 0 8px;
+}
+.intro { font-size: 11pt; font-weight: bold; margin-bottom: 6px; }
+.signature { margin-top: 16px; font-size: 11pt; }
+.no-print { margin: 18px auto; display: flex; gap: 12px; justify-content: center; }
+.no-print button {
+    padding: 10px 24px; font-size: 14px; cursor: pointer;
+    background: #636C8D; color: #fff; border: none; border-radius: 6px;
+}
+.no-print button.secondary { background: #999; }
+@media print { .no-print { display: none; } body { width: 100%; margin: 0; } }
+</style>
+</head>
+<body>
+
+${headerHTML}
+${personalTable}
+${educationBlock}
+
+<h1 class="title">ЗАЯВЛЕНИЕ</h1>
+<div class="intro">Прошу допустить меня к участию в конкурсе на 1 курс по следующим условиям приёма и основаниям приёма:</div>
+
+${hasBudget ? `<div style="margin-bottom:4px; font-size:10pt; font-weight:bold;">Бюджетные места в рамках КЦП:</div>` : ''}
+${budgetTable}
+
+${hasPaid ? `<div style="margin-top:10px; margin-bottom:4px; font-size:10pt; font-weight:bold;">По договорам об оказании платных образовательных услуг:</div>` : ''}
+${paidTable}
+
+${egeBlock}
+${viBlock}
+${benefitsBlock}
+${achBlock}
+${hostelBlock}
+${acknowledgeBlock}
+
+<div style="margin-top:10px;" class="text-small">
+В случае непоступления на обучение в ГГУ прошу вернуть мне оригиналы поданных документов
+(если такие предоставлялись) следующим способом: <u><b>лично</b></u>.
+</div>
+
+${langBlock}
+
+<div class="signature">
+«______» __________ ${currentYear} г.&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+Подпись _________________
+</div>
+
+<div style="text-align:right; margin-top:14px;" class="text-small">
+______________________________________ / ФИО сотрудника приёмной комиссии
+</div>
+
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button class="secondary" onclick="window.close()">✖️ Закрыть</button>
+</div>
+
+</body></html>`;
+
+        return html;
+    }
+
+    // Извлечь форму обучения из строки "6.44.03.02 - Очная"
+    function extractForm(directionStr) {
+        const m = (directionStr || '').match(/-\s*(Очная|Очно-заочная|Заочная)/i);
+        return m ? m[1] : 'Очная';
+    }
+
+    // =====================================================================
+    // ГЕНЕРАЦИЯ СОГЛАСИЯ ПД и ТИТУЛЬНОГО ЛИСТА (без изменений по сути,
+    // только используют новый формат данных)
+    // =====================================================================
+
+    function generateConsentHTML(data, manual) {
+        const p = data.profile;
+        const pass = data.passport;
+        const currentYear = new Date().getFullYear();
+        const rep = manual.representative;
+
+        // Блок данных субъекта (поступающего)
+        const subjectRow = `
+            <tr><td class="lab">Фамилия, имя, отчество</td><td class="val">${escapeHtml(p.fullName)}</td></tr>
+            <tr><td class="lab">Дата рождения</td><td class="val">${escapeHtml(p.birthday)}</td></tr>
+            <tr><td class="lab">Место рождения</td><td class="val">${escapeHtml(manual.birthPlace || '')}</td></tr>
+            <tr><td class="lab">Адрес регистрации</td><td class="val">${escapeHtml(p.regAddress)}</td></tr>
+            <tr><td class="lab">Документ, удостоверяющий личность</td><td class="val">${escapeHtml(passportConsentLine(pass) || 'Паспорт')}</td></tr>
+            <tr><td class="lab">Кем и когда выдан</td><td class="val">${escapeHtml(pass.date || '—')}, ${escapeHtml(manual.passportIssuedBy || '—')}</td></tr>
+            <tr><td class="lab">СНИЛС</td><td class="val">${escapeHtml(p.snils || '—')}</td></tr>
+            <tr><td class="lab">Контактный телефон</td><td class="val">${escapeHtml(p.phone || '—')}</td></tr>
+            <tr><td class="lab">Электронная почта</td><td class="val">${escapeHtml(p.email || '—')}</td></tr>
+        `;
+
+        // Блок представителя (если заполнен)
+        const repTable = rep && rep.name ? `
+            <h3>Сведения о законном представителе</h3>
+            <table class="info">
+                <tr><td class="lab">ФИО законного представителя</td><td class="val">${escapeHtml(rep.name)}</td></tr>
+                <tr><td class="lab">Документ, удостоверяющий личность</td><td class="val">${escapeHtml(rep.doc)}, серия ${escapeHtml(rep.series)}, № ${escapeHtml(rep.number)}</td></tr>
+                <tr><td class="lab">Кем и когда выдан</td><td class="val">${escapeHtml(rep.issued)}</td></tr>
+            </table>
+        ` : '';
+
+        // Преамбула: «Я, ФИО, ... даю согласие»
+        const preamble = rep && rep.name
+            ? `<p class="intro">Я, <b>${escapeHtml(rep.name)}</b>, действуя как законный представитель несовершеннолетнего <b>${escapeHtml(p.fullName)}</b>, в соответствии с требованиями ст. 9 Федерального закона от 27.07.2006 № 152-ФЗ «О персональных данных» даю своё согласие федеральному государственному бюджетному образовательному учреждению высшего образования «Гжельский государственный университет» (далее — Оператор), расположенному по адресу: 140155, Московская обл., г. о. Раменский, пос. Электроизолятор, д. 67, на обработку своих персональных данных и персональных данных представляемого лица.</p>`
+            : `<p class="intro">Я, <b>${escapeHtml(p.fullName)}</b>, в соответствии с требованиями ст. 9 Федерального закона от 27.07.2006 № 152-ФЗ «О персональных данных» даю своё согласие федеральному государственному бюджетному образовательному учреждению высшего образования «Гжельский государственный университет» (далее — Оператор), расположенному по адресу: 140155, Московская обл., г. о. Раменский, пос. Электроизолятор, д. 67, на обработку моих персональных данных.</p>`;
+
+        return `<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8">
+<title>Согласие на обработку ПД</title>
+<style>
+@page { size: A4; margin: 15mm; }
+body {
+    width: 180mm; margin: 10px auto;
+    font-family: 'Times New Roman', serif; font-size: 12pt;
+    color: #000; background: #fff;
+    line-height: 1.4;
+}
+.header {
+    text-align: right;
+    margin-bottom: 20px;
+    font-size: 11pt;
+}
+.header .rector { width: 70mm; margin-left: auto; }
+h1 {
+    text-align: center;
+    font-size: 14pt;
+    text-transform: uppercase;
+    margin: 24px 0 8px;
+    font-weight: bold;
+}
+.subtitle {
+    text-align: center;
+    font-size: 11pt;
+    margin-bottom: 18px;
+    color: #555;
+}
+h3 {
+    font-size: 12pt;
+    margin: 16px 0 6px;
+    font-weight: bold;
+    border-bottom: 1px solid #999;
+    padding-bottom: 2px;
+}
+table.info {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 8px;
+    font-size: 11pt;
+}
+table.info td {
+    border: 1px solid #000;
+    padding: 4px 8px;
+    vertical-align: top;
+}
+table.info td.lab {
+    width: 38%;
+    font-weight: 600;
+    background: #f4f4f4;
+}
+p { text-align: justify; margin: 8px 0; }
+p.intro { text-indent: 1cm; }
+ol.body { padding-left: 20px; }
+ol.body li { text-align: justify; margin: 6px 0; }
+.purpose {
+    margin: 8px 0;
+    padding: 8px 12px;
+    background: #f9f9f9;
+    border-left: 3px solid #636C8D;
+}
+.signature-block {
+    margin-top: 40px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+}
+.signature-block .date { width: 35%; }
+.signature-block .sig { width: 55%; text-align: center; }
+.signature-block .sig .line {
+    border-bottom: 1px solid #000;
+    height: 18px;
+    margin-bottom: 4px;
+}
+.signature-block .sig .caption { font-size: 9pt; color: #555; }
+.no-print { margin: 24px auto; display: flex; gap: 12px; justify-content: center; }
+.no-print button {
+    padding: 10px 24px; font-size: 14px; cursor: pointer;
+    background: #636C8D; color: #fff; border: none; border-radius: 6px; font-family: inherit;
+}
+.no-print button.secondary { background: #999; }
+@media print { .no-print { display: none; } body { margin: 0; } }
+</style></head><body>
+
+<div class="header">
+    <div class="rector">
+        Ректору ФГБОУ ВО<br>
+        «Гжельский государственный университет»<br>
+        Сомову Д.С.
+    </div>
+</div>
+
+<h1>Согласие<br>на обработку персональных данных</h1>
+<div class="subtitle">от поступающего${rep && rep.name ? ' (через законного представителя)' : ''}</div>
+
+<h3>Сведения о субъекте персональных данных</h3>
+<table class="info">
+${subjectRow}
+</table>
+
+${repTable}
+
+${preamble}
+
+<div class="purpose"><b>Цель обработки персональных данных:</b> участие в конкурсе и зачисление в число обучающихся в ФГБОУ ВО «Гжельский государственный университет», организация образовательного процесса, обеспечение деятельности Оператора в соответствии с действующим законодательством Российской Федерации.</div>
+
+<p><b>Перечень обрабатываемых персональных данных:</b> фамилия, имя, отчество; дата и место рождения; пол; гражданство; реквизиты документа, удостоверяющего личность; СНИЛС, ИНН; адреса регистрации и фактического проживания; контактный телефон, адрес электронной почты; сведения о составе семьи; сведения об образовании и документах об образовании; результаты вступительных испытаний и индивидуальных достижений; сведения о льготах и особых правах; фотоизображение.</p>
+
+<p><b>Перечень действий с персональными данными:</b> сбор, систематизация, накопление, хранение, уточнение (обновление, изменение), использование, передача (предоставление, доступ, в том числе трансграничная передача), обезличивание, блокирование, удаление, уничтожение персональных данных как с использованием средств автоматизации, так и без таковых.</p>
+
+<p>Оператор вправе передавать персональные данные третьим лицам в случаях, прямо предусмотренных законодательством Российской Федерации, в том числе федеральным органам исполнительной власти, осуществляющим функции в сфере образования.</p>
+
+<p>Настоящее согласие действует со дня его подписания и до достижения цели обработки персональных данных или до момента отзыва в письменной форме. Согласие может быть отозвано путём направления письменного заявления в адрес Оператора.</p>
+
+<p>Я подтверждаю, что ознакомлен(а) с правами субъекта персональных данных, предусмотренными Федеральным законом от 27.07.2006 № 152-ФЗ «О персональных данных».</p>
+
+<div class="signature-block">
+    <div class="date">
+        «______» ________________ ${currentYear} г.
+    </div>
+    <div class="sig">
+        <div class="line"></div>
+        <div class="caption">(подпись)</div>
+    </div>
+</div>
+
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button class="secondary" onclick="window.close()">✖️ Закрыть</button>
+</div>
+
+</body></html>`;
+    }
+
+    function generateTitlePageHTML(data, manual) {
+        const p = data.profile;
+        const currentYear = new Date().getFullYear();
+        const lang = manual.foreignLang || 'не указан';
+
+        // Собираем все конкурсные группы: бюджет первым, затем платные, внутри — по приоритету
+        const allComps = [];
+        for (const app of data.applications) {
+            for (const c of app.competitions) {
+                allComps.push({ ...c, appKind: app.kind });
+            }
+        }
+        allComps.sort((a, b) => {
+            if (a.appKind !== b.appKind) return a.appKind === 'budget' ? -1 : 1;
+            return parseInt(a.priority || '99') - parseInt(b.priority || '99');
+        });
+
+        // Группируем по направлению: одно направление — одна строка, профили через «/»
+        const dirMap = new Map();
+        for (const c of allComps) {
+            if (!dirMap.has(c.direction)) {
+                dirMap.set(c.direction, { direction: c.direction, programs: [], placeTypes: [], forms: [] });
+            }
+            const entry = dirMap.get(c.direction);
+            if (c.program && !entry.programs.includes(c.program)) {
+                entry.programs.push(c.program);
+            }
+            let typeLabel = '';
+            if (c.appKind === 'paid') {
+                typeLabel = 'По договору';
+            } else if (/отд[её]льн/i.test(c.placeType)) {
+                typeLabel = 'Отдельная квота';
+            } else if (/особ/i.test(c.placeType)) {
+                typeLabel = 'Особая квота';
+            } else if (/целев/i.test(c.placeType)) {
+                typeLabel = 'Целевая квота';
+            } else if (/основн|общ/i.test(c.placeType)) {
+                typeLabel = 'Основные места (КЦП)';
+            } else if (c.appKind === 'budget') {
+                typeLabel = 'Бюджет';
+            }
+            if (typeLabel && !entry.placeTypes.includes(typeLabel)) {
+                entry.placeTypes.push(typeLabel);
+            }
+            // Форма обучения: берём из колонки, с фолбэком на парсинг строки
+            const cForm = c.form || extractForm(c.direction);
+            if (cForm && !entry.forms.includes(cForm)) entry.forms.push(cForm);
+        }
+        const uniqueDirs = Array.from(dirMap.values());
+
+        const firstComp = allComps[0] || null;
+        const level = firstComp ? detectLevel(firstComp.direction) : { name: '' };
+        const form = firstComp ? (firstComp.form || extractForm(firstComp.direction)) : 'очная';
+
+        const hasBudget = allComps.some(c => c.appKind === 'budget');
+        const hasPaid   = allComps.some(c => c.appKind === 'paid');
+        const fundingDisplay = hasBudget && hasPaid ? 'Бюджет / Внебюджет'
+            : hasBudget ? 'Бюджет' : hasPaid ? 'Внебюджет' : '—';
+
+        // Размер шрифта: немного крупнее, адаптируется при большом количестве направлений
+        const dirFontSize  = uniqueDirs.length > 4 ? '9pt'   : '10pt';
+        const progFontSize = uniqueDirs.length > 4 ? '8pt'   : '9pt';
+        const typeFontSize = uniqueDirs.length > 4 ? '7.5pt' : '8.5pt';
+
+        const directionsHTML = uniqueDirs.map((d, i) => {
+            const prefix = uniqueDirs.length > 1 ? `${i + 1}.\u00a0` : '';
+            const typeStr = d.placeTypes.length
+                ? `<span style="font-size:${typeFontSize}; color:#333;"> \u2014 ${d.placeTypes.map(escapeHtml).join(', ')}</span>`
+                : '';
+            const formStr = d.forms.length
+                ? `<span style="font-size:${typeFontSize}; color:#555;"> (${d.forms.map(escapeHtml).join(', ')})</span>`
+                : '';
+            const progs = d.programs.length
+                ? `<br><i style="font-size:${progFontSize}; padding-left:12px;">${d.programs.map(escapeHtml).join(' / ')}</i>`
+                : '';
+            return `<p style="margin:3px 0; font-size:${dirFontSize}; text-align:left;">${prefix}<b>${escapeHtml(d.direction)}</b>${formStr}${typeStr}${progs}</p>`;
+        }).join('');
+
+        return `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Личное дело № ${escapeHtml(p.studentId)}</title>
+<style>
+@page { size: A4; margin: 15mm; }
+body { font-family: 'Times New Roman', serif; width: 180mm; margin: 0 auto; }
+.main { border: 1px solid #000; padding: 20px; text-align: center; min-height: 250mm; display: flex; flex-direction: column; }
+.main p { margin: 2px 0; }
+.right { text-align: right; padding-right: 40px; }
+.name { text-transform: uppercase; text-decoration: underline; font-size: 28pt; font-weight: bold; margin: 4px auto; }
+.padding { padding-top: 50px; }
+.footer { margin-top: auto; padding-top: 30px; }
+.no-print { margin: 18px auto; display: flex; gap: 12px; justify-content: center; }
+.no-print button { padding: 10px 24px; font-size: 14px; cursor: pointer;
+    background: #636C8D; color: #fff; border: none; border-radius: 6px; }
+@media print { .no-print { display: none; } }
+</style></head><body>
+
+<div class="main">
+    <p>МИНОБРНАУКИ РОССИИ</p>
+    <p>Федеральное государственное бюджетное образовательное учреждение высшего образования</p>
+    <p><b>«Гжельский государственный университет»</b></p>
+    <p>(ГГУ)</p>
+    <p>(${escapeHtml(form.toLowerCase())} форма обучения)</p>
+
+    <div class="right">
+        <p>${escapeHtml(fundingDisplay)}</p>
+        <p><u>${escapeHtml(lang)}</u> язык</p>
+    </div>
+
+    <p class="padding"><b>ЛИЧНОЕ ДЕЛО № ${escapeHtml(p.studentId)}</b></p>
+    <p class="name">${escapeHtml(p.lastName)}</p>
+    <p class="name">${escapeHtml(p.firstName)}</p>
+    <p class="name">${escapeHtml(p.middleName)}</p>
+
+    <div style="margin-top:20px; text-align:left;">
+        <p style="text-align:center; margin-bottom:4px;">${escapeHtml(level.name)}</p>
+        <p style="font-size:9pt; margin-bottom:2px; text-align:center;">Направление${uniqueDirs.length > 1 ? 'я' : ''} подготовки / специальность${uniqueDirs.length > 1 ? 'и' : ''}:</p>
+        ${directionsHTML}
+    </div>
+
+    <div class="footer">
+        <p>Год поступления — ${currentYear}</p>
+        <p>пос. Электроизолятор</p>
+    </div>
+</div>
+
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button onclick="window.close()" style="background:#999;">✖️ Закрыть</button>
+</div>
+
+</body></html>`;
+    }
+
+    function generateExamSheetHTML(data, sheetNum) {
+        const p = data.profile;
+        const { enrollments } = data.entranceExams || { enrollments: [] };
+
+        const allComps = [];
+        for (const app of data.applications) {
+            for (const c of app.competitions) allComps.push({ ...c, appKind: app.kind });
+        }
+        allComps.sort((a, b) => {
+            if (a.appKind !== b.appKind) return a.appKind === 'budget' ? -1 : 1;
+            return parseInt(a.priority || '99') - parseInt(b.priority || '99');
+        });
+        const firstComp = allComps[0] || null;
+        const form = firstComp ? (firstComp.form || extractForm(firstComp.direction)) : 'Очная';
+
+        const headerHTML = `
+            <table border="0" width="100%" cellspacing="0" cellpadding="2"
+                   style="border-bottom:3px double #333;">
+                <tr><td align="center">
+                    <font size="4"><b>ФГБОУ ВО «Гжельский государственный университет»</b></font>
+                </td></tr>
+            </table>
+            <table border="0" width="100%" cellspacing="0" cellpadding="2" style="font-size:12px;">
+                <tr><td align="center">
+                    РОССИЯ, 140155, г.&nbsp;Электроизолятор, д.&nbsp;67, тел.&nbsp;+7&nbsp;(496)&nbsp;464-76-40
+                </td></tr>
+            </table>`;
+
+        const studentRows = (includeForm) => `
+            <tr valign="bottom">
+                <td width="27%">Фамилия:</td>
+                <td width="73%"><span style="width:100%;border-bottom:1px solid;">
+                    <font size="4"><b>${escapeHtml(p.lastName)}</b></font></span></td>
+            </tr>
+            <tr valign="bottom">
+                <td>Имя:</td>
+                <td><span style="width:100%;border-bottom:1px solid;">
+                    <font size="4"><b>${escapeHtml(p.firstName)}</b></font></span></td>
+            </tr>
+            <tr valign="bottom">
+                <td>Отчество:</td>
+                <td><span style="width:100%;border-bottom:1px solid;">
+                    <font size="4"><b>${escapeHtml(p.middleName)}</b></font></span></td>
+            </tr>
+            <tr>
+                <td>Код:</td>
+                <td><span style="width:100%;border-bottom:1px solid;">
+                    <b>${escapeHtml(p.studentId)}</b></span></td>
+            </tr>
+            ${includeForm ? `
+            <tr valign="top">
+                <td>Форма обучения:</td>
+                <td><span style="width:100%;border-bottom:1px solid;">
+                    <b>${escapeHtml(form)}</b></span></td>
+            </tr>` : ''}
+            <tr valign="top"><td colspan="2">&nbsp;</td></tr>
+            <tr valign="top">
+                <td>Личная подпись:</td>
+                <td><span style="width:100%;border-bottom:1px solid;">&nbsp;</span></td>
+            </tr>`;
+
+        const tableHeader = (scoreLabel) => `
+            <tr>
+                <th width="4%">#</th>
+                <th>Дисциплина</th>
+                <th width="22%">Вид испытания</th>
+                <th width="14%">Дата испытания</th>
+                <th width="19%">ФИО преподавателя</th>
+                <th width="10%">${scoreLabel}</th>
+                <th width="10%">Подпись</th>
+            </tr>`;
+
+        const sheetBlock = (title, includeForm, showScore) => `
+            <table border="0" width="100%" cellpadding="0" cellspacing="0">
+                <tr><td valign="top">
+                    <p align="center">
+                        <font size="4"><b>${escapeHtml(title)}</b></font>
+                    </p>
+                    <table border="0" cellpadding="2" cellspacing="3" width="100%">
+                        <tr valign="top">
+                            <td width="140px" align="center"
+                                style="border:1px dashed #ccc;height:180px;vertical-align:middle;
+                                       color:#aaa;font-size:9pt;">фото</td>
+                            <td><table border="0" cellpadding="2" cellspacing="0">
+                                <tbody>${studentRows(includeForm)}</tbody>
+                            </table></td>
+                        </tr>
+                    </table>
+                    <br>
+                    <p align="center"><b>${showScore ? 'Результаты тестирования' : 'Оценки, полученные на вступительных испытаниях'}</b></p>
+                    <table class="border">
+                        <tbody>
+                        ${tableHeader(showScore ? 'Оценка, баллов' : 'Оценка')}
+                        ${enrollments.map((e, i) => `
+                        <tr bgcolor="#ffffff" valign="top">
+                            <td align="center">${i + 1}</td>
+                            <td>${escapeHtml(e.subject)}</td>
+                            <td>Вступительный экзамен (тест)</td>
+                            <td align="center">${escapeHtml(e.datetime)}</td>
+                            <td></td>
+                            <td align="center">${showScore ? escapeHtml(e.vviScore || '') : ''}</td>
+                            <td>&nbsp;</td>
+                        </tr>`).join('')}
+                        </tbody>
+                    </table>
+                    <br>
+                    <table border="0" cellpadding="2" cellspacing="0">
+                        <tr valign="top">
+                            <td>Ответственный секретарь приемной комиссии:</td>
+                            <td>_______________________</td>
+                        </tr>
+                    </table>
+                </td></tr>
+            </table>`;
+
+        const numStr = sheetNum ? `<u>&nbsp;${escapeHtml(sheetNum)}&nbsp;</u>` : '<u>&nbsp;&nbsp;&nbsp;___&nbsp;&nbsp;&nbsp;</u>';
+
+        return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8">
+<title>Экзаменационный лист — ${escapeHtml(p.fullName)}</title>
+<style>
+@page { size: A4; margin: 15mm; }
+body { font-family: Arial, sans-serif; font-size: 12pt; width: 180mm; margin: 0 auto; background: #fff; }
+table.border { width: 100%; border-collapse: collapse; }
+table.border th, table.border td { border: 1px solid #333; padding: 4px 6px; font-size: 10pt; }
+.no-print { margin: 18px auto; display: flex; gap: 12px; justify-content: center; }
+.no-print button { padding: 10px 24px; font-size: 14px; cursor: pointer;
+    background: #636C8D; color: #fff; border: none; border-radius: 6px; }
+@media print { .no-print { display: none; } body { width: 100%; margin: 0; } }
+</style></head><body>
+
+<div style="margin-bottom:20px;">
+    ${headerHTML}
+    <br>
+    <p align="center"><font size="4"><b>Экзаменационный лист № ${numStr}</b></font></p>
+    ${sheetBlock('', true, false)}
+</div>
+
+<div style="page-break-before:always; margin-bottom:20px;">
+    ${headerHTML}
+    <br>
+    ${sheetBlock('Лист результатов тестирования', false, true)}
+</div>
+
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button onclick="window.close()" style="background:#999;">✖️ Закрыть</button>
+</div>
+</body></html>`;
+    }
+
+    function generateReceiptHTML(data, manual) {
+        const p = data.profile;
+        const education = data.education?.[0] || {};
+        const receiptDate = new Date().toLocaleDateString('ru-RU');
+
+        return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8">
+<title>Расписка о приёме документов — ${escapeHtml(p.fullName)}</title>
+<style>
+@page { size: A4; margin: 15mm; }
+body { background:#fff; margin:0; }
+.receipt { width:175mm; min-height:285mm; padding:5mm; margin:0 auto; font-family:'Times New Roman', serif; font-size:11pt; line-height:1.2; }
+.receipt table { font-size:11pt; font-family:'Times New Roman', serif; }
+.receipt .center { text-align:center; }
+.receipt .fs20 { font-size:20px; }
+.receipt .inline { display:inline-block; }
+.receipt-hint { font-size:12px; }
+.receipt-name-line { text-align:center; border-bottom:1px solid #000; width:80%; }
+.receipt-caption { border-bottom:1px solid #000; margin-left:20px; font-size:10px; }
+.receipt-underline { border-bottom:1px solid #000; padding:0 8px; }
+.receipt-extra-line { display:block; margin-left:13px; border-bottom:1px solid #000; min-height:18px; }
+.receipt-empty-line { display:block; border-bottom:1px solid #000; min-height:18px; }
+.receipt-footer { width:100%; border:0; border-collapse:collapse; }
+.no-print { margin:18px auto; display:flex; gap:12px; justify-content:center; }
+.no-print button { padding:10px 24px; font-size:14px; cursor:pointer; background:#636C8D; color:#fff; border:none; border-radius:6px; }
+@media print { .no-print { display:none; } body { margin:0; } }
+</style></head><body>
+<section class="receipt">
+    <div class="center fs20">
+        МИНОБРНАУКИ РОССИИ<br>
+        Федеральное государственное бюджетное образовательное учреждение высшего образования<br>
+        <b>«Гжельский государственный университет»</b>
+    </div>
+    <br>
+    <div class="center fs20">РАСПИСКА №
+        <u>&nbsp;${escapeHtml(manual.regNumber || p.studentId || '')}&nbsp;</u><br>
+        <span>о приёме документов</span><br>
+        <span class="receipt-hint">(в случае утери расписки следует немедленно сообщить в ГГУ)</span>
+    </div>
+    <br><br>
+    <div class="inline">Получены от гр.&nbsp;</div>
+    <div class="inline receipt-name-line"><b>${escapeHtml(p.fullName || '')}</b></div>
+    <div class="center"><span class="receipt-caption">(фамилия, имя, отчество полностью)</span></div>
+    <br>
+    <div>следующие документы:</div>
+    <br>
+    <div>1. Заявление о приёме</div>
+    <br>
+    <div>2. Документ об образовании
+        <span class="receipt-underline">${escapeHtml(education.kind || education.section || '')}</span>
+        <br>
+        выдан <span class="receipt-underline">${escapeHtml(manual.eduIssuer || '')}</span>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        <span class="receipt-underline">Серия&nbsp;${escapeHtml(education.series || '')}&nbsp;№&nbsp;${escapeHtml(education.number || '')}</span>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        <label>оригинал <input type="radio" name="vo-receipt-edu-doc"></label>
+        <label>копия <input type="radio" name="vo-receipt-edu-doc"></label>
+    </div>
+    <br>
+    <div>3. Копия документа, удостоверяющего личность/гражданство</div>
+    <br>
+    <div>4. _____ фотографии (3×4)</div>
+    <br>
+    <div>5. Медицинская справка СЭМД 196</div>
+    <br>
+    <div>6. Выписка из трудовой книжки (копия трудовой книжки)</div>
+    <br>
+    <div>7. Копия СНИЛС</div>
+    <br>
+    <div>8. Копия документа, подтверждающего смену фамилии</div>
+    <br>
+    <div>9. <span class="receipt-extra-line">&nbsp;</span></div>
+    <br>
+    <div><span class="receipt-empty-line"></span></div>
+    <br>
+    <div><span class="receipt-empty-line"></span></div>
+    <br>
+    <div><span class="receipt-empty-line"></span></div>
+    <br>
+    <table class="receipt-footer">
+        <tr valign="bottom">
+            <td width="50%">Ответственный сотрудник приемной комиссии</td>
+            <td width="30%">_______________________</td>
+            <td align="right"><br><u>&nbsp;${receiptDate}&nbsp;</u>&nbsp;г.</td>
+        </tr>
+    </table>
+</section>
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button onclick="window.close()" style="background:#999;">✖️ Закрыть</button>
+</div>
+</body></html>`;
+    }
+
+    function generateCaseInventoryHTML(data) {
+        const p = data.profile;
+        const education = data.education?.[0] || {};
+
+        return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8">
+<title>Опись документов личного дела — ${escapeHtml(p.fullName)}</title>
+<style>
+@page { size: A4 landscape; margin: 10mm; }
+body { background:#fff; margin:0; }
+.case-inventory { width:197mm; min-height:210mm; padding:5mm 5mm 5mm 10mm; margin:0 auto; font-family:'Times New Roman', serif; }
+.case-inventory table { font-size:14pt; font-family:'Times New Roman', serif; }
+.case-inventory p { margin:10px 0; }
+.case-name-line { display:inline-block; width:100%; border-bottom:1px solid #000; }
+.case-caption { border-bottom:1px solid #000; }
+.case-underline { border-bottom:1px solid #000; padding:0 8px; }
+.case-empty-line { display:block; margin-left:20px; border-bottom:1px solid #000; min-height:18px; }
+.no-print { margin:18px auto; display:flex; gap:12px; justify-content:center; }
+.no-print button { padding:10px 24px; font-size:14px; cursor:pointer; background:#636C8D; color:#fff; border:none; border-radius:6px; }
+@media print { .no-print { display:none; } body { margin:0; } }
+</style></head><body>
+<section class="case-inventory">
+    <table>
+        <tr><td align="center"><font size="4">ОПИСЬ ДОКУМЕНТОВ ЛИЧНОГО ДЕЛА</font></td></tr>
+        <tr>
+            <td align="center">
+                <br>
+                <span class="case-name-line"><font size="4"><b>${escapeHtml(p.fullName || '')}</b></font></span>
+            </td>
+        </tr>
+        <tr><td align="center"><span class="case-caption"><font size="1">(фамилия, имя, отчество полностью)</font></span></td></tr>
+        <tr>
+            <td valign="top">
+                <br>
+                <p>1. Заявление о приёме <input type="checkbox"></p>
+                <p>2. Контактные данные абитуриента <input type="checkbox"></p>
+                <p>3. Письменные работы <input type="checkbox"></p>
+                <p>4. Документ об образовании <br>
+                    <span class="case-underline">${escapeHtml(education.kind || education.section || '')}</span>&nbsp;&nbsp;&nbsp;&nbsp;
+                    <label>оригинал <input type="radio" name="vo-case-edu-doc"></label>
+                    <label>копия <input type="radio" name="vo-case-edu-doc"></label>
+                </p>
+                <p>5. Копия паспорта <input type="checkbox"></p>
+                <p>6. _____ фотографии (3×4) <input type="checkbox"></p>
+                <p>7. СНИЛС <input type="checkbox"></p>
+                <p>8. Медицинская справка СЭМД – 196 <input type="checkbox"> /Копия действующей мед. книжки <input type="checkbox">.</p>
+                <p>9. Копия трудовой книжки <input type="checkbox"> / Справка с места работы <input type="checkbox">.</p>
+                <p>10. Копия документа, подтверждающего смену фамилии <input type="checkbox">.</p>
+                <p>11. Согласие на зачисление <input type="checkbox">.</p>
+                <p>12.<span class="case-empty-line"></span></p>
+                <p><span class="case-empty-line"></span></p>
+                <p>13.<span class="case-empty-line"></span></p>
+                <p><span class="case-empty-line"></span></p>
+                <p>14.<span class="case-empty-line"></span></p>
+                <p><span class="case-empty-line"></span></p>
+            </td>
+        </tr>
+    </table>
+</section>
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button onclick="window.close()" style="background:#999;">✖️ Закрыть</button>
+</div>
+</body></html>`;
+    }
+
+    function generateDormitoryApplicationHTML(data) {
+        const p = data.profile;
+        const allComps = [];
+        for (const app of data.applications || []) {
+            for (const c of app.competitions || []) allComps.push({ ...c, appKind: app.kind });
+        }
+        allComps.sort((a, b) => {
+            const pa = parseInt(a.priority || '99', 10);
+            const pb = parseInt(b.priority || '99', 10);
+            if (pa !== pb) return pa - pb;
+            if (a.appKind !== b.appKind) return a.appKind === 'budget' ? -1 : 1;
+            return 0;
+        });
+        const firstComp = allComps[0] || {};
+        const direction = [firstComp.direction, firstComp.program].filter(Boolean).join(' ');
+        const currentYear = new Date().getFullYear();
+        const academicYear = `${currentYear}/${String(currentYear + 1).slice(-2)}`;
+
+        return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8">
+<title>Заявление на общежитие — ${escapeHtml(p.fullName)}</title>
+<style>
+@page { size: A4; margin: 15mm; }
+body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-family:"Times New Roman", serif; font-size:12pt; }
+.right { text-align:right; }
+.center { text-align:center; }
+.line { border-bottom:1px solid #000; display:inline-block; min-width:70mm; padding:0 4px; text-align:center; }
+.wide-line { border-bottom:1px solid #000; display:inline; padding:0 4px; }
+.small { font-size:13px; }
+.signature { width:100%; margin-top:42px; border-collapse:collapse; }
+.signature td { vertical-align:bottom; }
+.sign-line { border-bottom:1px solid #000; height:20px; }
+.no-print { margin:18px auto; display:flex; gap:12px; justify-content:center; }
+.no-print button { padding:10px 24px; font-size:14px; cursor:pointer; background:#636C8D; color:#fff; border:none; border-radius:6px; }
+@media print { .no-print { display:none; } body { margin:0 auto; } }
+</style></head><body>
+    <p class="right">Ректору ФГБОУ ВО ГГУ</p>
+    <p class="right">Сомову Д.С.</p>
+    <p class="right">от <span class="line">${escapeHtml(p.fullName || '')}</span></p>
+    <p class="right">Направление подготовки/</p>
+    <p class="right">специальность</p>
+    <p class="right"><span class="line">${escapeHtml(direction || '')}</span></p>
+    <p class="right">Тел. <u>${escapeHtml(p.phone || '')}</u></p>
+
+    <p>&nbsp;</p>
+    <p class="center">ЗАЯВЛЕНИЕ</p>
+
+    <p style="text-align:justify;">Прошу предоставить место в общежитии на ${escapeHtml(academicYear)} учебный год. С Правилами внутреннего распорядка общежития ГГУ ознакомлен (а) и обязуюсь их выполнять.</p>
+
+    <p style="text-align:justify;">Зарегистрирован (а) по адресу: <span class="wide-line">${escapeHtml(p.regAddress || '')}</span></p>
+    <p style="text-align:justify;">Место жительства (фактич.): <span class="wide-line">${escapeHtml(p.factAddress || p.regAddress || '')}</span></p>
+
+    <table class="signature">
+        <tr>
+            <td width="15%"><div class="sign-line"></div></td>
+            <td width="35%"></td>
+            <td width="15%"><div class="sign-line"></div></td>
+            <td width="35%"></td>
+        </tr>
+        <tr>
+            <td><p class="small center">дата</p></td>
+            <td></td>
+            <td><p class="small center">подпись</p></td>
+            <td></td>
+        </tr>
+    </table>
+
+    <div class="no-print">
+        <button onclick="window.print()">🖨️ Распечатать</button>
+        <button onclick="window.close()" style="background:#999;">✖️ Закрыть</button>
+    </div>
+</body></html>`;
+    }
+
+    // =====================================================================
+    // ОТКРЫТИЕ ОКНА С ДОКУМЕНТОМ
+    // =====================================================================
+
+    function openDocWindow(html, title) {
+        const win = window.open('', '_blank');
+        if (!win) {
+            alert('Разрешите всплывающие окна для этого сайта');
+            return;
+        }
+        win.document.open();
+        win.document.write(html);
+        win.document.close();
+        win.document.title = title;
+    }
+
+    // =====================================================================
+    // ОБРАБОТЧИКИ КНОПОК
+    // =====================================================================
+
+    function handleApplication() {
+        try {
+            const data = collectAll();
+            if (!data.applications.length) {
+                alert('У абитуриента нет заявлений');
+                return;
+            }
+            openModal(data, (manual) => {
+                const html = generateApplicationHTML(data, manual);
+                openDocWindow(html, `Заявление № ${manual.regNumber || data.profile.studentId}`);
+            });
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function handleConsent() {
+        try {
+            const data = collectAll();
+            openModal(data, (manual) => {
+                const html = generateConsentHTML(data, manual);
+                openDocWindow(html, 'Согласие на обработку ПД');
+            });
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function handleTitlePage() {
+        try {
+            const data = collectAll();
+            openModal(data, (manual) => {
+                const html = generateTitlePageHTML(data, manual);
+                openDocWindow(html, `Личное дело № ${data.profile.studentId}`);
+            });
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function handleReceipt() {
+        try {
+            const data = collectAll();
+            openModal(data, (manual) => {
+                const html = generateReceiptHTML(data, manual);
+                openDocWindow(html, `Расписка — ${data.profile.fullName}`);
+            });
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function handleCaseInventory() {
+        try {
+            const data = collectAll();
+            const html = generateCaseInventoryHTML(data);
+            openDocWindow(html, `Опись документов — ${data.profile.fullName}`);
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function handleDormitoryApplication() {
+        try {
+            const data = collectAll();
+            const html = generateDormitoryApplicationHTML(data);
+            openDocWindow(html, `Заявление на общежитие — ${data.profile.fullName}`);
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function handleExamSheet() {
+        try {
+            const data = collectAll();
+            const { enrollments } = data.entranceExams || { enrollments: [] };
+            if (!enrollments.length) {
+                alert('У абитуриента нет записи на вступительные испытания (нет строк с датой и временем)');
+                return;
+            }
+            const savedManual = loadManual(data.profile);
+            const sheetNum = prompt('Номер экзаменационного листа (можно оставить пустым):', savedManual.examSheetNumber || '') ?? '';
+            saveManual(data.profile, { examSheetNumber: sheetNum.trim() });
+            const html = generateExamSheetHTML(data, sheetNum.trim());
+            openDocWindow(html, `Экзаменационный лист — ${data.profile.fullName}`);
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
+    function openAllDisclosures() {
+        let opened = 0;
+        const clicked = new WeakSet();
+        const pass = () => {
+            const sections = $$('section.group\\/disclosure, section[class*="group/disclosure"]');
+            for (const section of sections) {
+                if (clicked.has(section)) continue;
+                const button = section.querySelector(':scope > button') || (section.firstElementChild?.tagName === 'BUTTON' ? section.firstElementChild : null);
+                if (!button) continue;
+                const expanded = section.getAttribute('aria-expanded') || button.getAttribute('aria-expanded');
+                const content = section.querySelector(':scope > div');
+                const contentClass = content?.className || '';
+                const contentStyle = content?.getAttribute('style') || '';
+                const looksClosed = expanded !== 'true'
+                    || String(contentClass).includes('grid-rows-0')
+                    || /height:\s*0|opacity:\s*0|display:\s*none/i.test(contentStyle);
+                if (looksClosed) {
+                    clicked.add(section);
+                    button.click();
+                    opened += 1;
+                }
+            }
+        };
+        pass();
+        setTimeout(pass, 250);
+        setTimeout(pass, 600);
+        setTimeout(() => {
+            pass();
+            alert(opened ? `Открыто разделов: ${opened}` : 'Все разделы уже открыты');
+        }, 1000);
+    }
+
+    // =====================================================================
+    // ВЫПАДАЮЩЕЕ МЕНЮ + ЗАЩИТА ОТ РЕ-РЕНДЕРА
+    // =====================================================================
+
+    const DROPDOWN_ID = 'ggu-docs-dropdown';
+
+    function addButtons() {
+        const target = document.querySelector('main header div.flex.items-center.gap-3')
+            || document.querySelector('header div.flex.items-center.gap-3');
+        if (!target) return;
+        if (document.getElementById(DROPDOWN_ID)) return;
+
+        const wrapper = document.createElement('div');
+        wrapper.id = DROPDOWN_ID;
+        wrapper.style.cssText = 'position:relative; display:inline-block; margin-left:4px;';
+
+        const mainBtn = document.createElement('button');
+        mainBtn.type = 'button';
+        mainBtn.textContent = '📋 Документы ▾';
+        mainBtn.style.cssText = `padding:6px 14px; border-radius:8px; border:none;
+            background:#636C8D; color:#fff; cursor:pointer; font-size:13px; font-weight:600;`;
+
+        const panel = document.createElement('div');
+        panel.style.cssText = `display:none; position:absolute; right:0; top:calc(100% + 4px);
+            background:#fff; border-radius:8px; box-shadow:0 4px 20px rgba(0,0,0,.22);
+            min-width:215px; z-index:99998; overflow:hidden;`;
+
+        const items = [
+            { label: '↕️ Открыть все разделы',    handler: openAllDisclosures },
+            { label: '📄 Заявление',            handler: handleApplication },
+            { label: '🔏 Согласие ПД',           handler: handleConsent     },
+            { label: '📁 Титульный лист',         handler: handleTitlePage   },
+            { label: '🧾 Расписка',               handler: handleReceipt     },
+            { label: '📂 Опись документов',       handler: handleCaseInventory },
+            { label: '🏠 Заявление на общежитие', handler: handleDormitoryApplication },
+            { label: '📝 Экзаменационный лист',  handler: handleExamSheet   },
+        ];
+
+        items.forEach((item, i) => {
+            const el = document.createElement('button');
+            el.type = 'button';
+            el.textContent = item.label;
+            el.style.cssText = `display:block; width:100%; padding:9px 14px;
+                background:#fff; border:none;
+                border-bottom:${i < items.length - 1 ? '1px solid #f0f0f0' : 'none'};
+                cursor:pointer; font-size:13px; text-align:left; color:#333;`;
+            el.addEventListener('mouseenter', () => { el.style.background = '#f0f4ff'; });
+            el.addEventListener('mouseleave', () => { el.style.background = '#fff'; });
+            el.addEventListener('click', () => { panel.style.display = 'none'; item.handler(); });
+            panel.appendChild(el);
+        });
+
+        mainBtn.addEventListener('click', e => {
+            e.stopPropagation();
+            panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+        });
+        document.addEventListener('click', () => { panel.style.display = 'none'; });
+
+        wrapper.appendChild(mainBtn);
+        wrapper.appendChild(panel);
+        target.appendChild(wrapper);
+    }
+
+    // SPA — следим за DOM, чтобы меню не пропадало при перерисовке
+    const observer = new MutationObserver(() => {
+        if (!document.getElementById(DROPDOWN_ID)) addButtons();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', addButtons);
+    } else {
+        addButtons();
+    }
+    setTimeout(addButtons, 1500);
+
+})();
