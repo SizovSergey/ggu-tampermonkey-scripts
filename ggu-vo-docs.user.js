@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.4
+// @version      6.5
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -132,9 +132,15 @@
         };
     }
 
+    function isRussianForeignPassport(doc) {
+        const source = `${doc?.type || ''} ${doc?.kind || ''} ${doc?.name || ''}`.toLowerCase();
+        return /(загран|загранич)/i.test(source) && /(россий|рф|russian|rf)/i.test(source);
+    }
+
     function normalizePassportKind(kind) {
         const text = String(kind || '').trim();
         const lower = text.toLowerCase();
+        if (isRussianForeignPassport({ type: text })) return text;
         if (/иностран/.test(lower)) return 'Паспорт иностранного гражданина';
         if (/паспорт/.test(lower) && /(россий|рф|rf)/i.test(text)) return 'Паспорт гражданина Российской Федерации';
         return text;
@@ -212,7 +218,8 @@
         if (!sub) return {};
         const rows = documentRowsFromSubSection(sub);
         if (!rows.length) return {};
-        const docs = rows.map(parseDocumentRow);
+        const docs = rows.map(parseDocumentRow).filter(doc => !isRussianForeignPassport(doc));
+        if (!docs.length) return {};
         const data = docs
             .slice()
             .sort((a, b) => passportPriority(a, citizenship) - passportPriority(b, citizenship))[0];
