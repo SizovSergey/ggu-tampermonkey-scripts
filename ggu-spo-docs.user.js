@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.6
+// @version      1.7
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1062,10 +1062,10 @@
             !/Статус/i.test(s.status || '')
         );
         const specFundingLabel = s => {
-            const source = `${s.funding} ${s.status}`;
-            if (/внебюдж|плат|договор/i.test(source)) return 'Внебюджет';
-            if (/бюдж/i.test(source)) return 'Бюджет';
-            return '';
+            const source = `${s.funding} ${s.budgetLevel} ${s.status}`;
+            if (/внебюдж|плат|договор|полное\s+возмещ|коммер/i.test(source)) return 'Внебюджет';
+            if (/бюдж|кцп|контрольн.*цифр|особая\s+квота|отдельная\s+квота|целевая\s+квота|основные\s+места/i.test(source)) return 'Бюджет';
+            return 'Внебюджет';
         };
         const titleSpecMeta = s => [s.form || '', specFundingLabel(s)].filter(Boolean).join(', ');
         const hasBudgetSpec = specs.some(s => specFundingLabel(s) === 'Бюджет');
