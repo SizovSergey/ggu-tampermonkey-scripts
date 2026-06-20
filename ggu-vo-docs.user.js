@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.8
+// @version      6.9
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -238,6 +238,7 @@
             .sort((a, b) => comparePassports(a, b, citizenship))[0];
         return {
             kind: normalizePassportKind(data.type),
+            id: data.id,
             series: data.series,
             number: data.number,
             date: data.date,
@@ -275,15 +276,84 @@
                 if (!d.series && !d.number) continue;
                 result.push({
                     section: subTitle,        // напр., "Общее образование"
+                    id: d.id,
                     kind: d.type,             // напр., "Аттестат о среднем общем образовании"
                     name: d.name,             // напр., "Аттестат"
                     series: d.series,
                     number: d.number,
                     date: d.date,
+                    issuedBy: '',
                 });
             }
         }
-        return result;
+        return result.sort((a, b) => parseRuDate(b.date) - parseRuDate(a.date));
+    }
+
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function waitForElement(selector, timeoutMs = 2500) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const el = document.querySelector(selector);
+            if (el) return el;
+            await sleep(80);
+        }
+        return null;
+    }
+
+    function modalValueByLabel(modal, label) {
+        const labelEl = Array.from(modal.querySelectorAll('div'))
+            .find(el => txt(el) === label);
+        if (!labelEl) return '';
+        const container = labelEl.parentElement;
+        const valueEl = container?.querySelector(':scope > p, :scope > span, :scope > div:not(.leading-6)');
+        return txt(valueEl);
+    }
+
+    function documentRowById(id) {
+        if (!id) return null;
+        const docsSec = sectionByTitle('Документы');
+        const rows = docsSec
+            ? $$('div', docsSec).filter(d => {
+                const c = d.className || '';
+                return typeof c === 'string'
+                    && c.includes('grid-cols-[120px')
+                    && c.includes('hover:bg-primary-50');
+            })
+            : [];
+        return rows.find(row => txt($(':scope > p', row)) === String(id)) || null;
+    }
+
+    async function readDocumentModalIssuedBy(doc) {
+        const row = documentRowById(doc?.id);
+        const button = row?.querySelector(':scope > button.absolute-full, :scope > button');
+        if (!button) return '';
+        button.click();
+        const modal = await waitForElement('.ant-modal-root .ant-modal[role="dialog"], .ant-modal-root [role="dialog"]');
+        if (!modal) return '';
+        await sleep(150);
+        const issuedBy = modalValueByLabel(modal, 'Выдан');
+        const close = modal.querySelector('.ant-modal-close, button[aria-label="Close"]');
+        close?.click();
+        await sleep(150);
+        return issuedBy;
+    }
+
+    async function enrichDocumentIssuers(data) {
+        try {
+            if (data.passport?.id && !data.passport.issuedBy) {
+                data.passport.issuedBy = await readDocumentModalIssuedBy(data.passport);
+            }
+            const education = data.education?.[0];
+            if (education?.id && !education.issuedBy) {
+                education.issuedBy = await readDocumentModalIssuedBy(education);
+            }
+        } catch (e) {
+            console.warn('Не удалось автоматически прочитать поле "Выдан" из карточки документа', e);
+        }
+        return data;
     }
 
     function collectAchievements() {
@@ -602,6 +672,8 @@
         const profile = data.profile;
         const savedManual = loadManual(profile);
         const savedRep = savedManual.representative || {};
+        const passportIssuedBy = savedManual.passportIssuedBy || data.passport?.issuedBy || '';
+        const eduIssuer = savedManual.eduIssuer || data.education?.[0]?.issuedBy || '';
         const isMinor = (() => {
             if (!profile.birthday) return false;
             const m = profile.birthday.match(/(\d{2})\.(\d{2})\.(\d{4})/);
@@ -663,7 +735,7 @@
 
                 <h3>Паспорт</h3>
                 <label>Кем выдан и когда (полностью)
-                    <input type="text" id="m-passport-issuedBy" value="${escapeHtml(savedManual.passportIssuedBy || '')}" placeholder="ОУФМС России по г. Москве, 22.03.2021">
+                    <input type="text" id="m-passport-issuedBy" value="${escapeHtml(passportIssuedBy)}" placeholder="ОУФМС России по г. Москве, 22.03.2021">
                     <span class="hint">Например: «Отделом УФМС России по гор. Москве в р-не Кузьминки, 22.03.2021»</span>
                 </label>
 
@@ -686,7 +758,7 @@
 
                 <h3>Образование</h3>
                 <label>Образовательное учреждение, выдавшее документ
-                    <input type="text" id="m-eduIssuer" value="${escapeHtml(savedManual.eduIssuer || '')}" placeholder="МБОУ Гимназия № 1 г. Люберцы">
+                    <input type="text" id="m-eduIssuer" value="${escapeHtml(eduIssuer)}" placeholder="МБОУ Гимназия № 1 г. Люберцы">
                 </label>
 
                 <h3>Общежитие</h3>
@@ -1903,9 +1975,9 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
     // ОБРАБОТЧИКИ КНОПОК
     // =====================================================================
 
-    function handleApplication() {
+    async function handleApplication() {
         try {
-            const data = collectAll();
+            const data = await enrichDocumentIssuers(collectAll());
             if (!data.applications.length) {
                 alert('У абитуриента нет заявлений');
                 return;
@@ -1920,9 +1992,9 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
         }
     }
 
-    function handleConsent() {
+    async function handleConsent() {
         try {
-            const data = collectAll();
+            const data = await enrichDocumentIssuers(collectAll());
             openModal(data, (manual) => {
                 const html = generateConsentHTML(data, manual);
                 openDocWindow(html, 'Согласие на обработку ПД');
@@ -1933,9 +2005,9 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
         }
     }
 
-    function handleTitlePage() {
+    async function handleTitlePage() {
         try {
-            const data = collectAll();
+            const data = await enrichDocumentIssuers(collectAll());
             openModal(data, (manual) => {
                 const html = generateTitlePageHTML(data, manual);
                 openDocWindow(html, `Личное дело № ${data.profile.studentId}`);
@@ -1946,9 +2018,9 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
         }
     }
 
-    function handleReceipt() {
+    async function handleReceipt() {
         try {
-            const data = collectAll();
+            const data = await enrichDocumentIssuers(collectAll());
             openModal(data, (manual) => {
                 const html = generateReceiptHTML(data, manual);
                 openDocWindow(html, `Расписка — ${data.profile.fullName}`);
