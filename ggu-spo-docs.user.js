@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1742,8 +1742,10 @@ body { width: 175mm; margin: 10px auto; font-family: Arial, sans-serif; color: #
 h1.title { text-align: center; font-size: 13pt; font-weight: bold; margin: 14px 0 8px; }
 h2 { text-align: center; font-size: 13pt; margin: 10px 0; }
 h3 { font-size: 11pt; margin: 12px 0 6px; }
-.page { page-break-after: always; padding-top: 8mm; }
+.page { padding-top: 8mm; }
 .page:first-of-type { padding-top: 0; }
+section + section { page-break-before: always; break-before: page; }
+@media screen { section + section { margin-top: 18mm; } }
 .reg-num { font-size: 10pt; font-weight: bold; }
 .intro { font-size: 11pt; font-weight: bold; margin-bottom: 6px; }
 .t { width: 175mm; border-collapse: collapse; margin: 8px 0; }
