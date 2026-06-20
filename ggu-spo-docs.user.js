@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1061,7 +1061,14 @@
             !/Форма оплаты/i.test(s.funding || '') &&
             !/Статус/i.test(s.status || '')
         );
-        const hasBudgetSpec = specs.some(s => /бюдж/i.test(`${s.funding} ${s.status}`) && !/внебюдж/i.test(`${s.funding} ${s.status}`));
+        const specFundingLabel = s => {
+            const source = `${s.funding} ${s.status}`;
+            if (/внебюдж|плат|договор/i.test(source)) return 'Внебюджет';
+            if (/бюдж/i.test(source)) return 'Бюджет';
+            return '';
+        };
+        const titleSpecMeta = s => [s.form || '', specFundingLabel(s)].filter(Boolean).join(', ');
+        const hasBudgetSpec = specs.some(s => specFundingLabel(s) === 'Бюджет');
         const achievements = data.achievements || [];
         const preferences = manual.preferences?.length ? manual.preferences : data.preferences || [];
         const entranceTests = (manual.entranceTests?.length ? manual.entranceTests : data.entranceTests || [])
@@ -1341,7 +1348,10 @@
         <div style="margin-top:20px; text-align:center;">
             <p style="text-align:center; margin-bottom:4px;">Среднее профессиональное образование</p>
             <p style="font-size:9pt; margin-bottom:2px; text-align:center;">Профессии / специальности:</p>
-            ${specs.map((s, i) => `<p style="margin:3px 0; font-size:10pt; text-align:center;">${specs.length > 1 ? `${i + 1}.&nbsp;` : ''}<b>${escapeHtml(s.program)}</b><span style="font-size:8.5pt; color:#555;"> (${escapeHtml(s.form || '')})</span></p>`).join('')}
+            ${specs.map((s, i) => {
+                const meta = titleSpecMeta(s);
+                return `<p style="margin:3px 0; font-size:10pt; text-align:center;">${specs.length > 1 ? `${i + 1}.&nbsp;` : ''}<b>${escapeHtml(s.program)}</b>${meta ? `<span style="font-size:8.5pt; color:#555;"> (${escapeHtml(meta)})</span>` : ''}</p>`;
+            }).join('')}
         </div>
         <div class="footer">
             <p>Год поступления — ${year}</p>
