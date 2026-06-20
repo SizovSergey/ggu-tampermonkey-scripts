@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.5
+// @version      6.6
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -380,6 +380,33 @@
         const rows = $$('.ant-table-tbody tr.ant-table-row', sec);
         const enrollments = [];
         const egeResults = [];
+        const seenEnrollments = new Set();
+
+        const cellDateTime = (cell) => {
+            if (!cell) return '';
+            const preferred = txt(cell.querySelector('p.text-secondary')).trim();
+            if (/\d{2}\.\d{2}\.\d{4}/.test(preferred)) return preferred;
+            const raw = txt(cell).trim();
+            const m = raw.match(/\d{2}\.\d{2}\.\d{4}(?:\s+\d{2}:\d{2})?/);
+            return m ? m[0] : '';
+        };
+
+        const scoreFromCell = (cell) => {
+            if (!cell) return '';
+            const scoreDiv = $$('div', cell).find(d => {
+                const c = d.className || '';
+                return c.includes('flex-col') && c.includes('items-center');
+            });
+            const raw = scoreDiv ? txt(scoreDiv.querySelector('p')).trim() : txt(cell).trim();
+            return raw && /^\d+([.,]\d+)?$/.test(raw) ? raw : '';
+        };
+
+        const pushEnrollment = (item) => {
+            const key = [item.subject, item.typeInfo, item.datetime].join('|');
+            if (seenEnrollments.has(key)) return;
+            seenEnrollments.add(key);
+            enrollments.push(item);
+        };
 
         rows.forEach(tr => {
             const tds = $$(':scope > td.ant-table-cell', tr);
@@ -392,39 +419,17 @@
                 ? typeEl.textContent.replace(/\s+/g, ' ').trim()
                 : txt(tds[1]);
 
-            // Дата/время записи на ВИ — только p.text-secondary (без кабинета)
-            const dateEl = tds[2].querySelector('p.text-secondary');
-            if (dateEl) {
-                const dt = txt(dateEl);
-                if (dt) {
-                    // VVI score from col 4 (Результат ВВИ), same structure as EGE col
-                    let vviScore = '';
-                    if (tds.length > 4) {
-                        const vviDiv = $$('div', tds[4]).find(d => {
-                            const c = d.className || '';
-                            return c.includes('flex-col') && c.includes('items-center');
-                        });
-                        if (vviDiv) {
-                            const raw = txt(vviDiv.querySelector('p')).trim();
-                            if (raw && /^\d+([.,]\d+)?$/.test(raw)) vviScore = raw;
-                        }
-                    }
-                    enrollments.push({ subject, typeInfo, datetime: dt, vviScore });
-                }
+            const datetime = cellDateTime(tds[2]);
+            const vviScore = scoreFromCell(tds[4]);
+            const isInternalExam = /(^|[^А-Яа-я])(?:ВИ|ДВИ|ОВИ)([^А-Яа-я]|$)|вступительн/i.test(typeInfo);
+            if (subject && (datetime || vviScore || isInternalExam)) {
+                pushEnrollment({ subject, typeInfo, datetime, vviScore });
             }
 
             // Результат ЕГЭ — первый <p> внутри div с классами flex-col и items-center
-            const allDivs = $$('div', tds[3]);
-            const scoreDiv = allDivs.find(d => {
-                const c = d.className || '';
-                return c.includes('flex-col') && c.includes('items-center');
-            });
-            if (scoreDiv) {
-                const firstP = scoreDiv.querySelector('p');
-                const score = firstP ? txt(firstP).trim() : '';
-                if (score && /^\d+$/.test(score)) {
-                    egeResults.push({ subject, score });
-                }
+            const score = scoreFromCell(tds[3]);
+            if (score && /^\d+$/.test(score)) {
+                egeResults.push({ subject, score });
             }
         });
 
