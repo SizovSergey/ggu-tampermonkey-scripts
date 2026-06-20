@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.7
+// @version      6.8
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -434,8 +434,7 @@
 
             const datetime = cellDateTime(tds[2]);
             const vviScore = scoreFromCell(tds[4]);
-            const isInternalExam = /(^|[^А-Яа-я])(?:ВИ|ДВИ|ОВИ)([^А-Яа-я]|$)|вступительн/i.test(typeInfo);
-            if (subject && (datetime || vviScore || isInternalExam)) {
+            if (subject && datetime) {
                 pushEnrollment({ subject, typeInfo, datetime, vviScore });
             }
 
