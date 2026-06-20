@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1061,6 +1061,7 @@
             !/Форма оплаты/i.test(s.funding || '') &&
             !/Статус/i.test(s.status || '')
         );
+        const hasBudgetSpec = specs.some(s => /бюдж/i.test(`${s.funding} ${s.status}`) && !/внебюдж/i.test(`${s.funding} ${s.status}`));
         const achievements = data.achievements || [];
         const preferences = manual.preferences?.length ? manual.preferences : data.preferences || [];
         const entranceTests = (manual.entranceTests?.length ? manual.entranceTests : data.entranceTests || [])
@@ -1330,7 +1331,7 @@
         <p>(ГГУ)</p>
         <p>(${escapeHtml(firstSpec.form || 'очная форма')} обучения)</p>
         <div class="right">
-            <p>${escapeHtml(specs.some(s => /плат/i.test(s.funding)) ? 'Внебюджет' : 'Бюджет')}</p>
+            <p>${escapeHtml(hasBudgetSpec ? 'Бюджет' : 'Внебюджет')}</p>
             <p><u>${escapeHtml(manual.foreignLang || 'не указан')}</u> язык</p>
         </div>
         <p style="padding-top:50px;"><b>ЛИЧНОЕ ДЕЛО № ${escapeHtml(app.entrantId || regNum)}</b></p>
