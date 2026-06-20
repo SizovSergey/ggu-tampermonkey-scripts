@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.6
+// @version      6.7
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -158,6 +158,19 @@
         return 9;
     }
 
+    function parseRuDate(value) {
+        const m = String(value || '').match(/(\d{2})\.(\d{2})\.(\d{4})/);
+        if (!m) return 0;
+        const time = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])).getTime();
+        return Number.isFinite(time) ? time : 0;
+    }
+
+    function comparePassports(a, b, citizenship = '') {
+        const priorityDiff = passportPriority(a, citizenship) - passportPriority(b, citizenship);
+        if (priorityDiff) return priorityDiff;
+        return parseRuDate(b.date) - parseRuDate(a.date);
+    }
+
     function passportSeriesText(passport) {
         return passport?.series ? passport.series : '';
     }
@@ -222,7 +235,7 @@
         if (!docs.length) return {};
         const data = docs
             .slice()
-            .sort((a, b) => passportPriority(a, citizenship) - passportPriority(b, citizenship))[0];
+            .sort((a, b) => comparePassports(a, b, citizenship))[0];
         return {
             kind: normalizePassportKind(data.type),
             series: data.series,
