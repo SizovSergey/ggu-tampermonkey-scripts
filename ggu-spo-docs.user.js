@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1166,7 +1166,7 @@
                     <td class="div4">${escapeHtml(s.program)}</td>
                     <td style="text-align:center;" class="div4">${escapeHtml(s.educationLevel || 'СПО')}</td>
                     <td style="text-align:center;" class="div4">${escapeHtml(s.form)}</td>
-                    <td style="text-align:center;" class="div4">${/плат|договор|внебюдж/i.test(`${s.funding} ${s.status}`) ? '✓' : ''}</td>
+                    <td style="text-align:center;" class="div4"></td>
                 </tr>`)}
             </table>
         `;
@@ -1337,10 +1337,10 @@
         <p class="name">${escapeHtml(app.lastName)}</p>
         <p class="name">${escapeHtml(app.firstName)}</p>
         <p class="name">${escapeHtml(app.middleName)}</p>
-        <div style="margin-top:20px; text-align:left;">
+        <div style="margin-top:20px; text-align:center;">
             <p style="text-align:center; margin-bottom:4px;">Среднее профессиональное образование</p>
             <p style="font-size:9pt; margin-bottom:2px; text-align:center;">Профессии / специальности:</p>
-            ${specs.map((s, i) => `<p style="margin:3px 0; font-size:10pt; text-align:left;">${specs.length > 1 ? `${i + 1}.&nbsp;` : ''}<b>${escapeHtml(s.program)}</b><span style="font-size:8.5pt; color:#555;"> (${escapeHtml(s.form || '')})</span></p>`).join('')}
+            ${specs.map((s, i) => `<p style="margin:3px 0; font-size:10pt; text-align:center;">${specs.length > 1 ? `${i + 1}.&nbsp;` : ''}<b>${escapeHtml(s.program)}</b><span style="font-size:8.5pt; color:#555;"> (${escapeHtml(s.form || '')})</span></p>`).join('')}
         </div>
         <div class="footer">
             <p>Год поступления — ${year}</p>
