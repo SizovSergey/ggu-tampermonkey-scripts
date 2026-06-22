@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.7
+// @version      1.8
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1069,6 +1069,27 @@
         };
         const titleSpecMeta = s => [s.form || '', specFundingLabel(s)].filter(Boolean).join(', ');
         const hasBudgetSpec = specs.some(s => specFundingLabel(s) === 'Бюджет');
+        const groupedSpecs = [
+            { label: 'Бюджет', items: specs.filter(s => specFundingLabel(s) === 'Бюджет') },
+            { label: 'Внебюджет', items: specs.filter(s => specFundingLabel(s) !== 'Бюджет') },
+        ].filter(group => group.items.length);
+        let specRowNum = 0;
+        const admissionSpecRows = groupedSpecs.length
+            ? groupedSpecs.map(group => `
+                <tr class="admission-group-row"><td colspan="5">${escapeHtml(group.label)}</td></tr>
+                ${group.items.map(s => {
+                    specRowNum += 1;
+                    const fundingLabel = specFundingLabel(s);
+                    return `<tr>
+                        <td style="text-align:center; vertical-align:middle;">${specRowNum}</td>
+                        <td class="div4">${escapeHtml(s.program)}</td>
+                        <td style="text-align:center;" class="div4">${escapeHtml(s.educationLevel || 'СПО')}</td>
+                        <td style="text-align:center;" class="div4">${escapeHtml(s.form)}</td>
+                        <td style="text-align:center;" class="div4">${escapeHtml(fundingLabel)}</td>
+                    </tr>`;
+                }).join('')}
+            `).join('')
+            : '<tr><td colspan="5" style="text-align:center;">Нет данных</td></tr>';
         const achievements = data.achievements || [];
         const preferences = manual.preferences?.length ? manual.preferences : data.preferences || [];
         const entranceTests = (manual.entranceTests?.length ? manual.entranceTests : data.entranceTests || [])
@@ -1167,15 +1188,9 @@
                     <td width="35%" style="text-align:center; vertical-align:middle;"><div class="div2">Направление подготовки/ специальность</div></td>
                     <td width="15%" style="text-align:center; vertical-align:middle;"><div class="div2">Уровень</div></td>
                     <td width="15%" style="text-align:center; vertical-align:middle;"><div class="div2">Форма обучения</div></td>
-                    <td width="25%" style="text-align:center; vertical-align:middle;"><div class="div2">По договору об оказании платных образовательных услуг</div></td>
+                    <td width="25%" style="text-align:center; vertical-align:middle;"><div class="div2">Основа приема</div></td>
                 </tr>
-                ${tableRows(specs, (s, i) => `<tr>
-                    <td style="text-align:center; vertical-align:middle;">${i + 1}</td>
-                    <td class="div4">${escapeHtml(s.program)}</td>
-                    <td style="text-align:center;" class="div4">${escapeHtml(s.educationLevel || 'СПО')}</td>
-                    <td style="text-align:center;" class="div4">${escapeHtml(s.form)}</td>
-                    <td style="text-align:center;" class="div4"></td>
-                </tr>`)}
+                ${admissionSpecRows}
             </table>
         `;
 
@@ -1769,6 +1784,7 @@ section + section { page-break-before: always; break-before: page; }
 .div5 { font-size: 10pt; font-weight: lighter; }
 .original-title { text-align:center; font-size:12pt; font-weight:bold; margin-top:8px; }
 .admission-table td { font-size: 9pt; }
+.admission-group-row td { font-weight:bold; text-align:left; background:#f2f2f2; font-style:normal; }
 .rotate-priority { text-align:center; vertical-align:middle; }
 .rotate-priority div { transform: rotate(270deg); white-space: nowrap; font-size:11px; font-weight:bold; }
 .select-line { display:inline-block; min-width:45mm; border-bottom:1px solid #000; }
