@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — СПО Документы абитуриента
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.9
 // @description  Собирает данные по вкладкам заявления СПО и формирует комплект документов
 // @match        *://*/spo/admission/applications/*/*
 // @match        *://*/spo/admission/entrants/*/personal*
@@ -1188,7 +1188,7 @@
                     <td width="35%" style="text-align:center; vertical-align:middle;"><div class="div2">Направление подготовки/ специальность</div></td>
                     <td width="15%" style="text-align:center; vertical-align:middle;"><div class="div2">Уровень</div></td>
                     <td width="15%" style="text-align:center; vertical-align:middle;"><div class="div2">Форма обучения</div></td>
-                    <td width="25%" style="text-align:center; vertical-align:middle;"><div class="div2">Основа приема</div></td>
+                    <td width="25%" style="text-align:center; vertical-align:middle;"><div class="div2">Финансовая основа</div></td>
                 </tr>
                 ${admissionSpecRows}
             </table>
