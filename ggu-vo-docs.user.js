@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.10
+// @version      6.11
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -521,7 +521,10 @@
     // Определить уровень образования по коду и названию направления.
     // Аспирантура использует как старые коды XX.06/07.XX, так и современные
     // коды научных специальностей вида 1.5.7, 2.1.1, 5.8.7.
-    function detectLevel(directionCode) {
+    function detectLevel(directionCode, levelHint = '') {
+        if (levelHint === 'postgrad') {
+            return { name: 'Аспирантура', accessLevel: 'postgrad' };
+        }
         const source = String(directionCode || '');
         if (/аспирантур|научн(?:ая|ой)\s+специальност/i.test(source)) {
             return { name: 'Аспирантура', accessLevel: 'postgrad' };
@@ -544,6 +547,12 @@
         return map[lvl] || { name: '', accessLevel: '' };
     }
 
+    function currentEducationLevelHint() {
+        const tab = new URL(location.href).searchParams.get('tab') || '';
+        if (/postgraduateLevelGroup/i.test(tab)) return 'postgrad';
+        return '';
+    }
+
     function normalizeHeaderText(value) {
         return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
     }
@@ -555,7 +564,7 @@
             kgId: find(/^id кг$/i),
             competitionId: find(/^id конкурса$/i),
             organization: find(/^вуз$/i),
-            direction: find(/направление/),
+            direction: find(/направление|научн.*специальност|специальност/),
             program: find(/образовательная.*программа|программа.*профиль/),
             form: find(/форма обучения/),
             placeType: find(/вид мест/),
@@ -589,6 +598,7 @@
         });
 
         const apps = [];
+        const levelHint = currentEducationLevelHint();
         for (const s of subSections) {
             const header = s.querySelector('button');
             const headerText = header ? header.textContent : '';
@@ -636,6 +646,7 @@
                     organization:  txt(cellByColumn(tds, columns, 'organization', 2)),
                     direction:     txt(cellByColumn(tds, columns, 'direction', 3)),
                     program:       txt(cellByColumn(tds, columns, 'program', 4)),
+                    levelHint,
                     form,
                     placeType,
                     status:   txt(cellByColumn(tds, columns, 'status')) || (statusTd ? txt(statusTd) : ''),
@@ -852,8 +863,8 @@
         const { enrollments, egeResults } = data.entranceExams || { enrollments: [], egeResults: [] };
 
         // Определяем уровень образования по первому конкурсу первого заявления
-        const firstComp = apps[0]?.competitions?.[0];
-        const level = firstComp ? detectLevel(firstComp.direction) : { name: '', accessLevel: '' };
+        const firstComp = apps.flatMap(app => app.competitions)[0];
+        const level = firstComp ? detectLevel(firstComp.direction, firstComp.levelHint) : { name: '', accessLevel: '' };
 
         // Разделяем конкурсные группы на бюджетные и платные, сортируем по приоритету
         const allCompetitions = [];
@@ -872,7 +883,7 @@
 
         // Для магистратуры/аспирантуры не показываем колонки квот
         const isMasterOrPostgrad = budgetComps.length > 0 && budgetComps.every(c => {
-            const lvl = detectLevel(c.direction).accessLevel;
+            const lvl = detectLevel(c.direction, c.levelHint).accessLevel;
             return lvl === 'master' || lvl === 'postgrad';
         });
         const paidComps = allCompetitions
@@ -987,7 +998,7 @@
 
         // ---- Таблица бюджетных направлений ----
         const renderBudgetRow = (c, idx) => {
-            const lvlInfo = detectLevel(c.direction);
+            const lvlInfo = detectLevel(c.direction, c.levelHint);
             const levelName = lvlInfo.name || '—';
             return `
                 <tr>
@@ -1026,7 +1037,7 @@
 
         // ---- Таблица платных направлений ----
         const renderPaidRow = (c, idx) => {
-            const lvlInfo = detectLevel(c.direction);
+            const lvlInfo = detectLevel(c.direction, c.levelHint);
             const levelName = lvlInfo.name || '—';
             return `
                 <tr>
@@ -1496,7 +1507,7 @@ ${preamble}
         const uniqueDirs = Array.from(dirMap.values());
 
         const firstComp = allComps[0] || null;
-        const level = firstComp ? detectLevel(firstComp.direction) : { name: '' };
+        const level = firstComp ? detectLevel(firstComp.direction, firstComp.levelHint) : { name: '' };
         const form = firstComp ? (firstComp.form || extractForm(firstComp.direction)) : '';
 
         const hasBudget = allComps.some(c => c.appKind === 'budget');
