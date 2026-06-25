@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.9
+// @version      6.10
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -518,13 +518,20 @@
         return { enrollments, egeResults };
     }
 
-    // Определить уровень образования по коду направления
-    // Код вида X.YY.ZZ.WW или YY.ZZ.WW, где ZZ — уровень:
-    // 02 (СПО), 03 (бакалавриат), 04 (магистратура), 05 (специалитет), 06/07 (аспирантура)
+    // Определить уровень образования по коду и названию направления.
+    // Аспирантура использует как старые коды XX.06/07.XX, так и современные
+    // коды научных специальностей вида 1.5.7, 2.1.1, 5.8.7.
     function detectLevel(directionCode) {
-        const m = (directionCode || '').match(/\d+(?:\.\d+){2,3}/);
+        const source = String(directionCode || '');
+        if (/аспирантур|научн(?:ая|ой)\s+специальност/i.test(source)) {
+            return { name: 'Аспирантура', accessLevel: 'postgrad' };
+        }
+        const m = source.match(/\d+(?:\.\d+){2,3}/);
         if (!m) return { name: '', accessLevel: '' };
         const parts = m[0].split('.');
+        if (parts.length === 3 && parts[0].length === 1 && parts[1].length === 1) {
+            return { name: 'Аспирантура', accessLevel: 'postgrad' };
+        }
         const lvl = parts.length >= 4 ? parts[2] : parts[1];
         const map = {
             '02': { name: 'Среднее профессиональное', accessLevel: 'spo' },
