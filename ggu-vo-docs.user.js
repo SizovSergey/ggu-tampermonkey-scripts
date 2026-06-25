@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.11
+// @version      6.12
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -550,6 +550,10 @@
     function currentEducationLevelHint() {
         const tab = new URL(location.href).searchParams.get('tab') || '';
         if (/postgraduateLevelGroup/i.test(tab)) return 'postgrad';
+        const activeLevelTab = document.querySelector(
+            'a[data-status="active"][href*="postgraduateLevelGroup"], a[aria-current="page"][href*="postgraduateLevelGroup"]'
+        );
+        if (activeLevelTab) return 'postgrad';
         return '';
     }
 
@@ -893,6 +897,9 @@
         const currentYear = new Date().getFullYear();
         const today = new Date().toLocaleDateString('ru-RU');
         const tick = '✓'; // вместо AdmGraphics/tick.png
+        const educationLevelBlock = level.name
+            ? `<div style="margin:0 0 7px; font-size:11pt;"><b>Уровень образования:</b> ${escapeHtml(level.name)}</div>`
+            : '';
 
         // ---- Шапка ----
         const headerHTML = `
@@ -1236,6 +1243,7 @@ ${educationBlock}
 
 <h1 class="title">ЗАЯВЛЕНИЕ</h1>
 <div class="intro">Прошу допустить меня к участию в конкурсе на 1 курс по следующим условиям приёма и основаниям приёма:</div>
+${educationLevelBlock}
 
 ${hasBudget ? `<div style="margin-bottom:4px; font-size:10pt; font-weight:bold;">Бюджетные места в рамках КЦП:</div>` : ''}
 ${budgetTable}
