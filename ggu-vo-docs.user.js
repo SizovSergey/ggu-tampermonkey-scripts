@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.12
+// @version      6.13
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -356,22 +356,19 @@
         return data;
     }
 
-    function collectAchievements() {
-        // Ищем именно секцию достижений, чтобы не спутать ее с таблицами льгот/заявлений.
-        const sec = sectionByTitle('Индивидуальные достижения');
+    function collectAchievementsFromSection(sec) {
         if (!sec) return [];
 
-        // Читаем заголовки колонок достижений и индексы
         const achHeaders = [];
         $$('.ant-table-thead th', sec).forEach((th, idx) => {
             if ((th.className || '').includes('border-l')) {
                 const nameSpan = th.querySelector('.font-semibold');
-                achHeaders.push({ idx, name: txt(nameSpan) });
+                const name = txt(nameSpan);
+                if (name) achHeaders.push({ idx, name });
             }
         });
         if (!achHeaders.length) return [];
 
-        // Для каждой колонки собираем максимальный/любой ненулевой балл
         const scores = new Map(); // name -> score string
         $$('.ant-table-tbody tr.ant-table-row', sec).forEach(tr => {
             const tds = $$(':scope > td', tr);
@@ -390,6 +387,22 @@
         return achHeaders
             .filter(col => scores.has(col.name))
             .map(col => ({ name: col.name, score: scores.get(col.name) }));
+    }
+
+    function collectAchievements() {
+        // Новая анкета держит баллы в "Общих индивидуальных достижениях",
+        // а одноименный блок в "Документах" содержит только подтверждающие файлы.
+        const sections = $$('section.group\\/disclosure, section[class*="group/disclosure"]');
+        const candidates = sections
+            .map(sec => ({ sec, title: txt(sec.querySelector('button > span')).toLowerCase() }))
+            .filter(x => x.title.includes('индивидуальные достижения'))
+            .sort((a, b) => Number(b.title.includes('общие')) - Number(a.title.includes('общие')));
+
+        for (const { sec } of candidates) {
+            const achievements = collectAchievementsFromSection(sec);
+            if (achievements.length) return achievements;
+        }
+        return [];
     }
 
     function collectOlympiads() {
