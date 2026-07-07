@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.13
+// @version      6.14
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -603,6 +603,11 @@
         return '';
     }
 
+    function isExcludedCompetitionStatus(status) {
+        const text = String(status || '').replace(/ё/g, 'е').replace(/\s+/g, ' ').trim().toLowerCase();
+        return /отозван|отклонен/.test(text);
+    }
+
     function collectApplications() {
         // Каждое заявление — это section внутри секции "Заявления"
         const appsSec = sectionByTitle('Заявления');
@@ -669,7 +674,9 @@
                     status:   txt(cellByColumn(tds, columns, 'status')) || (statusTd ? txt(statusTd) : ''),
                     priority: txt(cellByColumn(tds, columns, 'priority')) || (priorityTd ? txt(priorityTd) : ''),
                 };
-            });
+            }).filter(c => !isExcludedCompetitionStatus(c.status));
+
+            if (!competitions.length) continue;
 
             apps.push({
                 number: numMatch ? numMatch[1] : '',
