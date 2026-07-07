@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.15
+// @version      6.16
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -648,6 +648,7 @@
             const tableColumnCache = new WeakMap();
             const competitions = $$('.ant-table-tbody tr.ant-table-row', s).map(tr => {
                 const tds = $$(':scope > td', tr);
+                const rowText = txt(tr);
                 const table = tr.closest('table');
                 let columns = {};
                 if (table) {
@@ -684,8 +685,10 @@
                     placeType,
                     status:   txt(cellByColumn(tds, columns, 'status')) || (statusTd ? txt(statusTd) : ''),
                     priority: txt(cellByColumn(tds, columns, 'priority')) || (priorityTd ? txt(priorityTd) : ''),
+                    rowText,
                 };
-            }).filter(c => !isExcludedCompetitionStatus(c.status));
+            }).filter(c => !isExcludedCompetitionStatus(`${c.status} ${c.rowText}`))
+                .map(({ rowText, ...c }) => c);
 
             if (!competitions.length) continue;
 
