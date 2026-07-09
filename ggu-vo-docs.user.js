@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.16
+// @version      6.17
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -193,6 +193,127 @@
             passport?.number ? `№ ${passport.number}` : '',
         ].filter(Boolean);
         return parts.join(', ');
+    }
+
+    const VO_TUITION_PRICES = {
+        fullTime: {},
+        partTime: {},
+        mixedTime: {},
+    };
+
+    function shortFio(fullName) {
+        const parts = String(fullName || '').trim().split(/\s+/).filter(Boolean);
+        if (!parts.length) return '';
+        const [lastName, firstName = '', middleName = ''] = parts;
+        const initials = [firstName, middleName].filter(Boolean).map(part => `${part[0]}.`).join('');
+        return initials ? `${lastName} ${initials}` : lastName;
+    }
+
+    function directionCode(value) {
+        return (value || '').match(/\b\d+(?:\.\d+){2,3}\b/)?.[0] || '';
+    }
+
+    function tuitionFormKey(value) {
+        const text = (value || '').toLowerCase();
+        if (/очно[-\s]?заоч/.test(text)) return 'mixedTime';
+        if (/заоч/.test(text)) return 'partTime';
+        return 'fullTime';
+    }
+
+    function formatMoney(value) {
+        const n = Number(String(value || '').replace(/[^\d]/g, ''));
+        return n ? new Intl.NumberFormat('ru-RU').format(n) : '';
+    }
+
+    function moneyToWordsRu(value) {
+        const n = Number(String(value || '').replace(/[^\d]/g, ''));
+        if (!n) return '';
+        const ones = [
+            ['', 'один', 'два', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'],
+            ['', 'одна', 'две', 'три', 'четыре', 'пять', 'шесть', 'семь', 'восемь', 'девять'],
+        ];
+        const teens = ['десять', 'одиннадцать', 'двенадцать', 'тринадцать', 'четырнадцать', 'пятнадцать', 'шестнадцать', 'семнадцать', 'восемнадцать', 'девятнадцать'];
+        const tens = ['', '', 'двадцать', 'тридцать', 'сорок', 'пятьдесят', 'шестьдесят', 'семьдесят', 'восемьдесят', 'девяносто'];
+        const hundreds = ['', 'сто', 'двести', 'триста', 'четыреста', 'пятьсот', 'шестьсот', 'семьсот', 'восемьсот', 'девятьсот'];
+        const plural = (num, forms) => {
+            const mod100 = num % 100;
+            const mod10 = num % 10;
+            if (mod100 >= 11 && mod100 <= 19) return forms[2];
+            if (mod10 === 1) return forms[0];
+            if (mod10 >= 2 && mod10 <= 4) return forms[1];
+            return forms[2];
+        };
+        const triad = (num, female) => {
+            const parts = [];
+            parts.push(hundreds[Math.floor(num / 100)]);
+            const rem = num % 100;
+            if (rem >= 10 && rem <= 19) {
+                parts.push(teens[rem - 10]);
+            } else {
+                parts.push(tens[Math.floor(rem / 10)]);
+                parts.push(ones[female ? 1 : 0][rem % 10]);
+            }
+            return parts.filter(Boolean).join(' ');
+        };
+        const millions = Math.floor(n / 1000000);
+        const thousands = Math.floor((n % 1000000) / 1000);
+        const rest = n % 1000;
+        const parts = [];
+        if (millions) parts.push(`${triad(millions, false)} ${plural(millions, ['миллион', 'миллиона', 'миллионов'])}`);
+        if (thousands) parts.push(`${triad(thousands, true)} ${plural(thousands, ['тысяча', 'тысячи', 'тысяч'])}`);
+        if (rest) parts.push(triad(rest, false));
+        return `${parts.join(' ')} ${plural(n, ['рубль', 'рубля', 'рублей'])}`;
+    }
+
+    function contractYearsCeil(term) {
+        const text = String(term || '').toLowerCase();
+        const yearsMatch = text.match(/(\d+)\s*(?:год|года|лет)/);
+        const monthsMatch = text.match(/(\d+)\s*(?:месяц|месяца|месяцев|мес)/);
+        const years = yearsMatch ? Number(yearsMatch[1]) : 0;
+        const months = monthsMatch ? Number(monthsMatch[1]) : 0;
+        if (!years && !months) return 0;
+        return years + (months > 0 ? 1 : 0);
+    }
+
+    function monthsToTerm(monthsValue) {
+        const months = Number(monthsValue || 0);
+        if (!months) return '';
+        const years = Math.floor(months / 12);
+        const rest = months % 12;
+        const yearWord = years % 10 === 1 && years % 100 !== 11 ? 'год' : (years % 10 >= 2 && years % 10 <= 4 && (years % 100 < 10 || years % 100 >= 20) ? 'года' : 'лет');
+        const monthWord = rest % 10 === 1 && rest % 100 !== 11 ? 'месяц' : (rest % 10 >= 2 && rest % 10 <= 4 && (rest % 100 < 10 || rest % 100 >= 20) ? 'месяца' : 'месяцев');
+        return [years ? `${years} ${yearWord}` : '', rest ? `${rest} ${monthWord}` : ''].filter(Boolean).join(' ');
+    }
+
+    function contractTermForComp(comp) {
+        const source = `${comp?.program || ''} ${comp?.direction || ''}`;
+        const months = source.match(/(\d+)\s*мес/i)?.[1];
+        return monthsToTerm(months);
+    }
+
+    function tuitionPriceForComp(comp) {
+        const code = directionCode(`${comp?.direction || ''} ${comp?.program || ''}`);
+        const formKey = tuitionFormKey(comp?.form || comp?.direction || '');
+        return VO_TUITION_PRICES[formKey]?.[code] || '';
+    }
+
+    function contractCompKey(comp) {
+        return [
+            directionCode(`${comp?.direction || ''} ${comp?.program || ''}`),
+            comp?.direction || '',
+            comp?.program || '',
+            comp?.form || '',
+            comp?.placeType || '',
+        ].join('|');
+    }
+
+    function passportContractLine(doc, issuedBy) {
+        return [
+            doc?.series ? `серия ${doc.series}` : '',
+            doc?.number ? `№ ${doc.number}` : '',
+            doc?.date ? `выдан ${doc.date}` : '',
+            issuedBy || doc?.issuedBy || '',
+        ].filter(Boolean).join(', ');
     }
 
     // =====================================================================
@@ -728,8 +849,36 @@
         const profile = data.profile;
         const savedManual = loadManual(profile);
         const savedRep = savedManual.representative || {};
+        const savedContract = savedManual.contract || {};
         const passportIssuedBy = savedManual.passportIssuedBy || data.passport?.issuedBy || '';
         const eduIssuer = savedManual.eduIssuer || data.education?.[0]?.issuedBy || '';
+        const savedCustomerPassport = savedContract.customerPassport || {};
+        const modalCustomerPassport = {
+            series: savedCustomerPassport.series || data.passport?.series || '',
+            number: savedCustomerPassport.number || data.passport?.number || '',
+            date: savedCustomerPassport.date || data.passport?.date || '',
+            issuedBy: savedCustomerPassport.issuedBy || passportIssuedBy || data.passport?.issuedBy || '',
+        };
+        const paidComps = (data.applications || [])
+            .flatMap(app => (app.competitions || []).map(c => ({ ...c, appKind: app.kind })))
+            .filter(c => c.appKind === 'paid' || /плат|договор|внебюдж/i.test(`${c.placeType || ''} ${c.status || ''}`));
+        const contractComps = paidComps.length ? paidComps : [];
+        const modalContractComp = contractComps.find(c => contractCompKey(c) === savedContract.compKey) || contractComps[0] || {};
+        const modalContractPrice = savedContract.price || formatMoney(tuitionPriceForComp(modalContractComp));
+        const modalContractTerm = savedContract.term || contractTermForComp(modalContractComp);
+        const contractCompOptions = contractComps.map((comp, index) => {
+            const key = contractCompKey(comp) || String(index);
+            const price = tuitionPriceForComp(comp);
+            const term = contractTermForComp(comp);
+            const label = [
+                comp.direction,
+                comp.program,
+                comp.form,
+                comp.placeType,
+                price ? `${formatMoney(price)} руб.` : 'цена не задана',
+            ].filter(Boolean).join(' | ');
+            return `<option value="${escapeHtml(key)}" data-price="${escapeHtml(price)}" data-term="${escapeHtml(term)}" ${key === savedContract.compKey ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+        }).join('');
         const isMinor = (() => {
             if (!profile.birthday) return false;
             const m = profile.birthday.match(/(\d{2})\.(\d{2})\.(\d{4})/);
@@ -825,6 +974,44 @@
                     <input type="text" id="m-eduIssuer" value="${escapeHtml(eduIssuer)}" placeholder="МБОУ Гимназия № 1 г. Люберцы">
                 </label>
 
+                <h3>Договор на платное обучение</h3>
+                <label>Платное направление
+                    <select id="m-contract-comp">
+                        ${contractCompOptions || '<option value="">Нет платных направлений</option>'}
+                    </select>
+                </label>
+                <div class="row">
+                    <label>Номер договора
+                        <input type="text" id="m-contract-number" value="${escapeHtml(savedContract.number || '')}" placeholder="оставьте пустым">
+                    </label>
+                    <label>Стоимость за год
+                        <input type="text" id="m-contract-price" value="${escapeHtml(modalContractPrice)}" placeholder="например: 150000">
+                    </label>
+                    <label>Срок обучения
+                        <input type="text" id="m-contract-term" value="${escapeHtml(modalContractTerm)}" placeholder="например: 4 года">
+                    </label>
+                </div>
+                <label>Заказчик
+                    <input type="text" id="m-contract-customer" value="${escapeHtml(savedContract.customer || profile.fullName || '')}">
+                </label>
+                <div class="row">
+                    <label>Серия паспорта заказчика
+                        <input type="text" id="m-contract-customer-passport-series" value="${escapeHtml(modalCustomerPassport.series)}">
+                    </label>
+                    <label>Номер паспорта заказчика
+                        <input type="text" id="m-contract-customer-passport-number" value="${escapeHtml(modalCustomerPassport.number)}">
+                    </label>
+                    <label>Дата выдачи
+                        <input type="text" id="m-contract-customer-passport-date" value="${escapeHtml(modalCustomerPassport.date)}">
+                    </label>
+                </div>
+                <label>Кем выдан паспорт заказчика
+                    <input type="text" id="m-contract-customer-passport-issued" value="${escapeHtml(modalCustomerPassport.issuedBy)}">
+                </label>
+                <label>Адрес регистрации заказчика
+                    <textarea id="m-contract-customer-address" rows="2">${escapeHtml(savedContract.customerAddress || cleanPlaceholder(savedManual.regAddress) || profile.regAddress || '')}</textarea>
+                </label>
+
                 <h3>Общежитие</h3>
                 <div class="checkbox-row">
                     <input type="radio" id="m-hostel-no" name="hostel" value="0" ${!savedManual.needsHostel ? 'checked' : ''}>
@@ -873,6 +1060,13 @@
         const close = () => overlay.remove();
         overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
         $('#m-cancel', overlay).addEventListener('click', close);
+        $('#m-contract-comp', overlay)?.addEventListener('change', e => {
+            const selected = e.target.selectedOptions?.[0];
+            const price = selected?.dataset.price || '';
+            const term = selected?.dataset.term || '';
+            $('#m-contract-price', overlay).value = formatMoney(price);
+            $('#m-contract-term', overlay).value = term;
+        });
         $('#m-ok', overlay).addEventListener('click', () => {
             const manual = {
                 passportIssuedBy: $('#m-passport-issuedBy', overlay).value.trim(),
@@ -883,6 +1077,20 @@
                 eduIssuer: $('#m-eduIssuer', overlay).value.trim(),
                 needsHostel: $('input[name="hostel"]:checked', overlay).value === '1',
                 regNumber: $('#m-regNum', overlay).value.trim(),
+                contract: {
+                    compKey: $('#m-contract-comp', overlay)?.value || '',
+                    number: $('#m-contract-number', overlay).value.trim(),
+                    price: $('#m-contract-price', overlay).value.trim(),
+                    term: $('#m-contract-term', overlay).value.trim(),
+                    customer: $('#m-contract-customer', overlay).value.trim(),
+                    customerPassport: {
+                        series: $('#m-contract-customer-passport-series', overlay).value.trim(),
+                        number: $('#m-contract-customer-passport-number', overlay).value.trim(),
+                        date: $('#m-contract-customer-passport-date', overlay).value.trim(),
+                        issuedBy: $('#m-contract-customer-passport-issued', overlay).value.trim(),
+                    },
+                    customerAddress: $('#m-contract-customer-address', overlay).value.trim(),
+                },
                 representative: isMinor ? {
                     name: $('#m-rep-name', overlay).value.trim(),
                     doc: $('#m-rep-doc', overlay).value.trim(),
@@ -2025,6 +2233,176 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
 </body></html>`;
     }
 
+    function generatePaidContractHTML(data, manual) {
+        const p = profileWithManual(data.profile, manual);
+        const pass = data.passport || {};
+        const contract = manual.contract || {};
+        const paidComps = [];
+        for (const app of data.applications || []) {
+            for (const c of app.competitions || []) {
+                const comp = { ...c, appKind: app.kind };
+                if (comp.appKind === 'paid' || /плат|договор|внебюдж/i.test(`${comp.placeType || ''} ${comp.status || ''}`)) {
+                    paidComps.push(comp);
+                }
+            }
+        }
+        const selectedComp = paidComps.find(c => contractCompKey(c) === contract.compKey) || paidComps[0] || {};
+        const contractNumber = contract.number || '';
+        const contractCustomer = contract.customer || p.fullName || '';
+        const applicantFullName = p.fullName || '';
+        const applicantShortName = shortFio(applicantFullName);
+        const contractCustomerShortName = shortFio(contractCustomer);
+        const contractPriceValue = contract.price || tuitionPriceForComp(selectedComp) || '';
+        const contractPrice = formatMoney(contractPriceValue) || '________________';
+        const contractPriceWords = moneyToWordsRu(contractPriceValue) || '________________';
+        const contractYearPriceNumber = Number(String(contractPriceValue || '').replace(/[^\d]/g, ''));
+        const contractHalfPriceValue = contractYearPriceNumber ? Math.round(contractYearPriceNumber / 2) : '';
+        const contractHalfPrice = formatMoney(contractHalfPriceValue) || '________________';
+        const contractHalfPriceWords = moneyToWordsRu(contractHalfPriceValue) || '________________';
+        const contractTerm = contract.term || contractTermForComp(selectedComp) || '________________';
+        const contractYears = contractYearsCeil(contractTerm);
+        const contractFullPriceValue = contractYears && contractYearPriceNumber ? contractYearPriceNumber * contractYears : '';
+        const contractFullPrice = formatMoney(contractFullPriceValue) || '________________';
+        const contractFullPriceWords = moneyToWordsRu(contractFullPriceValue) || '________________';
+        const contractFirstPaymentDate = contract.firstPaymentDate || '«____» __________ 20__ г.';
+        const contractSecondPaymentDate = contract.secondPaymentDate || '«____» __________ 20__ г.';
+        const contractNextFirstPaymentDate = contract.nextFirstPaymentDate || '«____» __________';
+        const contractNextSecondPaymentDate = contract.nextSecondPaymentDate || '«____» __________';
+        const customerPassport = contract.customerPassport || {};
+        const contractCustomerPassport = passportContractLine(customerPassport, customerPassport.issuedBy);
+        const applicantPassportLine = passportContractLine(pass, manual.passportIssuedBy);
+        const contractCustomerAddress = contract.customerAddress || p.regAddress || '';
+        const contractProgram = selectedComp.program || selectedComp.direction || '__________________________________________';
+        const contractDirection = [
+            selectedComp.form,
+            selectedComp.direction,
+            selectedComp.placeType,
+        ].filter(Boolean).join(', ') || '__________________________________________';
+        const storageKey = manualStorageKey(data.profile);
+
+        return `<!DOCTYPE html><html lang="ru"><head>
+<meta charset="UTF-8">
+<title>Договор на платное обучение — ${escapeHtml(p.fullName || '')}</title>
+<style>
+@page { size:A4; margin:12mm; }
+body { background:#fff; margin:0; }
+.paid-contract { width:175mm; min-height:280mm; margin:0 auto; font-family:'Times New Roman', serif; font-size:11pt; line-height:1.18; }
+.paid-contract p { text-align:justify; text-indent:1cm; margin:4px 0; }
+.paid-contract h3 { text-align:center; font-size:11pt; margin:16px 0 6px; }
+.contract-title { text-align:center; font-size:11pt; font-weight:bold; }
+.contract-place { display:flex; justify-content:space-between; margin:10px 0; }
+.contract-line { border-bottom:1px solid #000; font-style:italic; font-weight:bold; text-align:center; padding:0 5px; min-height:16px; }
+.contract-caption { font-size:9pt; font-style:italic; text-align:center; margin-bottom:3px; }
+.contract-date-input { width:42mm; border:0; border-bottom:1px solid #000; padding:0 2mm; font-family:'Times New Roman', serif; font-size:11pt; text-align:center; background:#fffbe8; }
+.contract-date-input:focus { outline:1px solid #636C8D; background:#fff; }
+.contract-parties { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-top:10px; font-size:10pt; overflow-wrap:anywhere; page-break-inside:avoid; }
+.contract-parties div { border-top:1px solid #000; padding-top:4px; }
+.contract-bottom-signs { width:175mm; border-collapse:collapse; margin:16px 0 6px; font-size:11pt; }
+.contract-bottom-signs td { width:33.33%; padding:5px 6px; vertical-align:bottom; text-align:left; }
+.contract-bottom-signs .contract-sign-names td { font-size:10pt; padding-top:0; }
+.contract-stamp { text-indent:0 !important; margin:8px 0 !important; }
+.contract-executor { width:100%; margin-top:15px; font-size:14px; }
+.contract-executor-caption { text-indent:70mm; font-size:14px; }
+.no-print { margin:18px auto; display:flex; gap:12px; justify-content:center; }
+.no-print button { padding:10px 24px; font-size:14px; cursor:pointer; background:#636C8D; color:#fff; border:none; border-radius:6px; }
+@media print { .no-print { display:none; } body { margin:0; } .contract-date-input { background:transparent; outline:0; } }
+</style></head><body>
+<section class="paid-contract">
+    <div class="contract-title">ДОГОВОР № <u>&nbsp;${escapeHtml(contractNumber || '_____')}&nbsp;</u></div>
+    <div class="contract-title">об образовании на обучение по образовательным программам</div>
+    <div class="contract-title">высшего образования</div>
+    <div class="contract-place"><span>Пос. Электроизолятор</span><span>«____» __________ 202__ г.</span></div>
+
+    <p>Федеральное государственное бюджетное образовательное учреждение высшего образования «Гжельский государственный университет» (ГГУ), осуществляющее образовательную деятельность на основании лицензии и свидетельства о государственной аккредитации, именуемое в дальнейшем «Исполнитель», в лице ректора Сомова Дениса Сергеевича, действующего на основании Устава,</p>
+    <div class="contract-line">${escapeHtml(contractCustomer)}</div>
+    <div class="contract-caption">(фамилия, имя, отчество Заказчика)</div>
+    <p>именуемая(ый) в дальнейшем «Заказчик», и</p>
+    <div class="contract-line">${escapeHtml(applicantFullName)}</div>
+    <div class="contract-caption">(фамилия, имя, отчество лица, зачисляемого на обучение)</div>
+    <p>именуемый в дальнейшем «Обучающийся», совместно именуемые Стороны, заключили настоящий Договор о нижеследующем:</p>
+
+    <h3>I. Предмет Договора</h3>
+    <p>1.1. Исполнитель обязуется предоставить образовательную услугу, а Обучающийся/Заказчик обязуется оплатить обучение по образовательной программе</p>
+    <div class="contract-line">${escapeHtml(contractProgram)}</div>
+    <div class="contract-caption">(наименование образовательной программы высшего образования)</div>
+    <div class="contract-line">${escapeHtml(contractDirection)}</div>
+    <div class="contract-caption">(форма обучения, код, направление подготовки / специальность)</div>
+    <p>в пределах федерального государственного образовательного стандарта или образовательного стандарта в соответствии с учебными планами, в том числе индивидуальными, и образовательными программами Исполнителя.</p>
+    <p>1.2. Срок освоения образовательной программы на момент подписания Договора составляет <u>&nbsp;${escapeHtml(contractTerm)}&nbsp;</u>. Срок обучения по индивидуальному учебному плану, в том числе ускоренному обучению, составляет __________________________.</p>
+    <p>1.3. После освоения Обучающимся образовательной программы и успешного прохождения государственной итоговой аттестации ему выдается документ об образовании и о квалификации установленного образца.</p>
+
+    <h3>II. Взаимодействие сторон</h3>
+    <p>2.1. Исполнитель вправе самостоятельно осуществлять образовательный процесс, выбирать системы оценок, формы, порядок и периодичность промежуточной аттестации Обучающегося.</p>
+    <p>2.2. Заказчик вправе получать информацию от Исполнителя по вопросам организации и обеспечения надлежащего предоставления услуг, предусмотренных разделом I настоящего Договора.</p>
+    <p>2.3. Обучающемуся предоставляются академические права в соответствии с Федеральным законом от 29 декабря 2012 г. № 273-ФЗ «Об образовании в Российской Федерации».</p>
+    <p>2.4. Исполнитель обязан зачислить Обучающегося, выполнившего установленные законодательством Российской Федерации, учредительными документами, локальными нормативными актами Исполнителя условия приема, в качестве студента.</p>
+    <p>2.5. Заказчик и (или) Обучающийся обязаны своевременно вносить плату за предоставляемые образовательные услуги в размере и порядке, определенных настоящим Договором.</p>
+
+    <h3>III. Стоимость образовательных услуг, сроки и порядок их оплаты</h3>
+    <p>3.1. Полная стоимость образовательных услуг за весь период обучения Обучающегося составляет <u>&nbsp;${escapeHtml(contractFullPrice)}&nbsp;</u> рублей (${escapeHtml(contractFullPriceWords)}). В соответствии со ст. 149 НК РФ стоимость услуг НДС не облагается.</p>
+    <p>3.2. Стоимость образовательных услуг за первый год обучения составляет <u>&nbsp;${escapeHtml(contractPrice)}&nbsp;</u> рублей (${escapeHtml(contractPriceWords)}).</p>
+    <p>Оплата производится в следующем порядке:</p>
+    <p>- за первый год обучения <u>&nbsp;${escapeHtml(contractHalfPrice)}&nbsp;</u> (${escapeHtml(contractHalfPriceWords)}) рублей до <input class="contract-date-input contract-date-first" value="${escapeHtml(contractFirstPaymentDate)}">, и <u>&nbsp;${escapeHtml(contractHalfPrice)}&nbsp;</u> (${escapeHtml(contractHalfPriceWords)}) рублей до <input class="contract-date-input contract-date-second" value="${escapeHtml(contractSecondPaymentDate)}">;</p>
+    <p>- за второй и последующие учебные годы оплата производится до <input class="contract-date-input contract-date-next-first" value="${escapeHtml(contractNextFirstPaymentDate)}"> и до <input class="contract-date-input contract-date-next-second" value="${escapeHtml(contractNextSecondPaymentDate)}">, в размере половины стоимости обучения в текущем учебном году.</p>
+    <p>3.3. Приказ о зачислении Обучающегося издается после поступления оплаты за обучение на расчетный счет или в кассу Исполнителя.</p>
+    <p>3.4. Увеличение стоимости платных образовательных услуг после заключения Договора не допускается, за исключением увеличения стоимости с учетом уровня инфляции, предусмотренного законодательством Российской Федерации.</p>
+
+    <h3>IV. Порядок изменения и расторжения Договора</h3>
+    <p>4.1. Условия, на которых заключен настоящий Договор, могут быть изменены по соглашению Сторон или в соответствии с законодательством Российской Федерации.</p>
+    <p>4.2. Настоящий Договор может быть расторгнут по соглашению Сторон.</p>
+    <p>4.3. Настоящий Договор может быть расторгнут по инициативе Исполнителя в случаях, предусмотренных законодательством Российской Федерации.</p>
+
+    <h3>V. Ответственность сторон и порядок рассмотрения споров</h3>
+    <p>5.1. За неисполнение или ненадлежащее исполнение обязательств по Договору Стороны несут ответственность, предусмотренную законодательством Российской Федерации и настоящим Договором.</p>
+    <p>5.2. Все споры по настоящему Договору разрешаются Сторонами путем переговоров, а при невозможности достижения согласия - в судебном порядке по месту нахождения Исполнителя.</p>
+
+    <h3>VI. Срок действия Договора</h3>
+    <p>Настоящий Договор вступает в силу со дня его заключения Сторонами и действует до полного исполнения Сторонами обязательств.</p>
+
+    <h3>VII. Заключительные положения</h3>
+    <p>7.1. Сведения, указанные в настоящем Договоре, соответствуют информации, размещенной на официальном сайте Исполнителя в сети Интернет на дату заключения настоящего Договора.</p>
+    <p>7.2. Настоящий Договор составлен в 2 экземплярах, по одному для каждой из Сторон. Все экземпляры имеют одинаковую юридическую силу.</p>
+
+    <h3>VIII. Адреса и реквизиты Сторон</h3>
+    <div class="contract-parties">
+        <div><b>Исполнитель</b><br>ГГУ<br>Адрес: 140155 Московская область, Раменский м.о., пос. Электроизолятор, д. 67<br>ИНН/КПП 5040036468/504001001<br>Тел./факс: 8-496-464-76-40<br>Ректор</div>
+        <div><b>Заказчик</b><br>ФИО: ${escapeHtml(contractCustomer)}<br>Адрес регистрации: ${escapeHtml(contractCustomerAddress)}<br>Паспортные данные: ${escapeHtml(contractCustomerPassport)}<br>Тел.: __________________</div>
+        <div><b>Обучающийся</b><br>ФИО: ${escapeHtml(applicantFullName)}<br>Адрес регистрации: ${escapeHtml(p.regAddress || '')}<br>Паспортные данные: ${escapeHtml(applicantPassportLine)}<br>Тел.: ${escapeHtml(p.phone || '__________________')}</div>
+    </div>
+    <table class="contract-bottom-signs">
+        <tr><td>Ректор</td><td>Заказчик</td><td>Обучающийся</td></tr>
+        <tr><td>________________</td><td>________________</td><td>________________</td></tr>
+        <tr class="contract-sign-names"><td>Д.С. Сомов</td><td>${escapeHtml(contractCustomerShortName)}</td><td>${escapeHtml(applicantShortName)}</td></tr>
+    </table>
+    <p class="contract-stamp">М.П.</p>
+    <div class="contract-executor">Исполнитель ______________________/______________________</div>
+    <div class="contract-executor-caption">(подпись) &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (ФИО)</div>
+</section>
+<div class="no-print">
+    <button onclick="window.print()">🖨️ Распечатать</button>
+    <button onclick="window.close()" style="background:#999;">✖️ Закрыть</button>
+</div>
+<script>
+(() => {
+    const storageKey = ${JSON.stringify(storageKey)};
+    const save = (field, value) => {
+        try {
+            const data = JSON.parse(localStorage.getItem(storageKey) || '{}');
+            data.contract = data.contract || {};
+            data.contract[field] = value.trim();
+            data.updatedAt = new Date().toISOString();
+            localStorage.setItem(storageKey, JSON.stringify(data));
+        } catch (e) {}
+    };
+    document.querySelector('.contract-date-first')?.addEventListener('input', e => save('firstPaymentDate', e.target.value));
+    document.querySelector('.contract-date-second')?.addEventListener('input', e => save('secondPaymentDate', e.target.value));
+    document.querySelector('.contract-date-next-first')?.addEventListener('input', e => save('nextFirstPaymentDate', e.target.value));
+    document.querySelector('.contract-date-next-second')?.addEventListener('input', e => save('nextSecondPaymentDate', e.target.value));
+})();
+</script>
+</body></html>`;
+    }
+
     // =====================================================================
     // ОТКРЫТИЕ ОКНА С ДОКУМЕНТОМ
     // =====================================================================
@@ -2123,6 +2501,26 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
         }
     }
 
+    async function handlePaidContract() {
+        try {
+            const data = await enrichDocumentIssuers(collectAll());
+            const paidComps = (data.applications || [])
+                .flatMap(app => (app.competitions || []).map(c => ({ ...c, appKind: app.kind })))
+                .filter(c => c.appKind === 'paid' || /плат|договор|внебюдж/i.test(`${c.placeType || ''} ${c.status || ''}`));
+            if (!paidComps.length) {
+                alert('У абитуриента нет платных направлений для договора');
+                return;
+            }
+            openModal(data, (manual) => {
+                const html = generatePaidContractHTML(data, manual);
+                openDocWindow(html, `Договор на платное обучение — ${data.profile.fullName}`);
+            });
+        } catch (e) {
+            console.error(e);
+            alert('Ошибка: ' + e.message);
+        }
+    }
+
     function handleExamSheet() {
         try {
             const data = collectAll();
@@ -2209,6 +2607,7 @@ body { width:175mm; min-height:270mm; margin:10px auto; background:#fff; font-fa
             { label: '🧾 Расписка',               handler: handleReceipt     },
             { label: '📂 Опись документов',       handler: handleCaseInventory },
             { label: '🏠 Заявление на общежитие', handler: handleDormitoryApplication },
+            { label: '💳 Договор на платное обучение', handler: handlePaidContract },
             { label: '📝 Экзаменационный лист',  handler: handleExamSheet   },
         ];
 
