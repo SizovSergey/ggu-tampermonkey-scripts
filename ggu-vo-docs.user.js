@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ГГУ — Документы абитуриента (Заявление + Согласие ПД + Титульный лист)
 // @namespace    http://tampermonkey.net/
-// @version      6.17
+// @version      6.18
 // @description  Формирует заявление о приёме (по XSLT-шаблону ГГУ), согласие на обработку ПД и титульный лист личного дела
 // @match        *://*/vo/admission/entrants/*/profile*
 // @updateURL    https://raw.githubusercontent.com/SizovSergey/ggu-tampermonkey-scripts/main/ggu-vo-docs.user.js
@@ -17,8 +17,8 @@
     // УТИЛИТЫ
     // =====================================================================
 
-    const $ = (sel, root = document) => root.querySelector(sel);
-    const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+    const $ = (sel, root = document) => (root || document).querySelector(sel);
+    const $$ = (sel, root = document) => Array.from((root || document).querySelectorAll(sel));
 
     function txt(el, def = '') {
         return el ? el.textContent.trim().replace(/\s+/g, ' ') : def;
@@ -27,6 +27,10 @@
     function cleanPlaceholder(value) {
         const text = String(value || '').replace(/\s+/g, ' ').trim();
         return /^[-–—]+$/.test(text) ? '' : text;
+    }
+
+    function normalizedText(value) {
+        return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
     }
 
     function escapeHtml(str) {
@@ -71,8 +75,9 @@
     // Найти ближайший к лейблу элемент-значение (для блоков "Лейбл / значение")
     function valueByLabel(labelText, root = document) {
         const labels = $$('.leading-6', root);
+        const needle = normalizedText(labelText);
         for (const lab of labels) {
-            if (lab.textContent.trim().toLowerCase().includes(labelText.toLowerCase())) {
+            if (normalizedText(lab.textContent).includes(needle)) {
                 let sib = lab.nextElementSibling;
                 if (!sib) continue;
                 // иногда значение лежит во вложенном div'е
@@ -83,12 +88,27 @@
         return '';
     }
 
-    // Найти секцию по заголовку (кнопка > span с нужным текстом)
+    function sectionHeaderControl(section) {
+        if (!section) return null;
+        return section.querySelector(':scope > button, :scope > [role="button"]')
+            || (section.firstElementChild?.matches?.('button, [role="button"]') ? section.firstElementChild : null);
+    }
+
+    function sectionHeaderText(section) {
+        const header = sectionHeaderControl(section);
+        return txt(header);
+    }
+
+    function sectionContentElement(section) {
+        const header = sectionHeaderControl(section);
+        return Array.from(section?.children || []).find(child => child !== header && child.tagName === 'DIV') || null;
+    }
+
+    // Найти секцию по заголовку аккордеона.
     function sectionByTitle(title) {
         const sections = $$('section.group\\/disclosure, section[class*="group/disclosure"]');
         for (const s of sections) {
-            const span = s.querySelector('button > span');
-            if (span && span.textContent.trim().toLowerCase().includes(title.toLowerCase())) {
+            if (sectionHeaderText(s).toLowerCase().includes(title.toLowerCase())) {
                 return s;
             }
         }
@@ -101,8 +121,7 @@
         if (!docsSec) return null;
         const subs = $$('section', docsSec);
         for (const s of subs) {
-            const span = s.querySelector('button > span');
-            if (span && span.textContent.trim().toLowerCase().includes(title.toLowerCase())) {
+            if (sectionHeaderText(s).toLowerCase().includes(title.toLowerCase())) {
                 return s;
             }
         }
@@ -387,9 +406,8 @@
         if (!docsSec) return [];
 
         const subs = $$('section', docsSec).filter(s => {
-            const span = s.querySelector('button > span');
-            if (!span) return false;
-            const t = span.textContent.toLowerCase();
+            const t = sectionHeaderText(s).toLowerCase();
+            if (!t) return false;
             // НЕ "удостоверяющие личность", НЕ "индивидуальные достижения", НЕ "олимпиад"
             if (t.includes('удостовер')) return false;
             if (t.includes('достижен')) return false;
@@ -400,7 +418,7 @@
 
         const result = [];
         for (const sub of subs) {
-            const subTitle = txt(sub.querySelector('button > span'));
+            const subTitle = sectionHeaderText(sub);
             const rows = documentRowsFromSubSection(sub);
             for (const row of rows) {
                 const d = parseDocumentRow(row);
@@ -526,7 +544,7 @@
         // а одноименный блок в "Документах" содержит только подтверждающие файлы.
         const sections = $$('section.group\\/disclosure, section[class*="group/disclosure"]');
         const candidates = sections
-            .map(sec => ({ sec, title: txt(sec.querySelector('button > span')).toLowerCase() }))
+            .map(sec => ({ sec, title: sectionHeaderText(sec).toLowerCase() }))
             .filter(x => x.title.includes('индивидуальные достижения'))
             .sort((a, b) => Number(b.title.includes('общие')) - Number(a.title.includes('общие')));
 
@@ -747,15 +765,14 @@
 
         // Заявления — это под-секции вида "ЗАЯВЛЕНИЕ № 250025"
         const subSections = $$('section', appsSec).filter(s => {
-            const btn = s.querySelector('button > div');
-            return btn && /заявление/i.test(btn.textContent) && /№/.test(btn.textContent);
+            const headerText = sectionHeaderText(s);
+            return /заявление/i.test(headerText) && /№/.test(headerText);
         });
 
         const apps = [];
         const levelHint = currentEducationLevelHint();
         for (const s of subSections) {
-            const header = s.querySelector('button');
-            const headerText = header ? header.textContent : '';
+            const headerText = sectionHeaderText(s);
             const numMatch = headerText.match(/№\s*(\d+)/);
             const isBudget = /бюджетные/i.test(headerText);
             const isPaid = /платные/i.test(headerText);
@@ -2547,10 +2564,10 @@ body { background:#fff; margin:0; }
             const sections = $$('section.group\\/disclosure, section[class*="group/disclosure"]');
             for (const section of sections) {
                 if (clicked.has(section)) continue;
-                const button = section.querySelector(':scope > button') || (section.firstElementChild?.tagName === 'BUTTON' ? section.firstElementChild : null);
+                const button = sectionHeaderControl(section);
                 if (!button) continue;
                 const expanded = section.getAttribute('aria-expanded') || button.getAttribute('aria-expanded');
-                const content = section.querySelector(':scope > div');
+                const content = sectionContentElement(section);
                 const contentClass = content?.className || '';
                 const contentStyle = content?.getAttribute('style') || '';
                 const looksClosed = expanded !== 'true'
